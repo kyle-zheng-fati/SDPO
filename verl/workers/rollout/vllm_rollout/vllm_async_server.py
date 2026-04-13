@@ -355,10 +355,13 @@ class vLLMHttpServer:
 
         # update lora-related args
         if self.model_config.lora_rank > 0:
+            multi_lora = getattr(self.model_config, "multi_lora", False)
+            from verl.workers.rollout.vllm_rollout.utils import MULTI_LORA_MAX_ADAPTERS
+            max_loras = MULTI_LORA_MAX_ADAPTERS if multi_lora else 1
             args.update(
                 {
                     "enable_lora": True,
-                    "max_loras": 1,
+                    "max_loras": max_loras,
                     "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
                 }
             )
@@ -465,6 +468,7 @@ class vLLMHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        lora_adapter_name: Optional[str] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # Calculate the maximum possible new tokens based on available context space
@@ -504,15 +508,28 @@ class vLLMHttpServer:
 
         prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
 
-        # Add lora request
+        # Add lora request — route to a specific adapter in multi-LoRA mode
         lora_request = None
         if self.model_config.lora_rank > 0:
-            # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
-                )
+            if lora_adapter_name is not None:
+                # Multi-LoRA: route to the named adapter.
+                from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+                role_info = ROLE_LORA_REGISTRY.get(lora_adapter_name)
+                if role_info is not None:
+                    loaded_ids = await self.engine.list_loras()
+                    if role_info["int_id"] in loaded_ids:
+                        lora_request = LoRARequest(
+                            lora_name=role_info["name"],
+                            lora_int_id=role_info["int_id"],
+                            lora_path=role_info["path"],
+                        )
+            else:
+                # Single-adapter mode (backward compat).
+                lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+                if lora_loaded:
+                    lora_request = LoRARequest(
+                        lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                    )
 
         generator = self.engine.generate(
             prompt=prompt,

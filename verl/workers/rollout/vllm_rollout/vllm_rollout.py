@@ -124,11 +124,16 @@ class vLLMAsyncRollout(BaseRollout):
         self.tokenizer = self.model_config.tokenizer
         self.inference_engine: WorkerWrapperBase = None
         self.address = self._init_zeromq()
-        self.lora_config = (
-            {"max_loras": 1, "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank)}
-            if self.model_config.lora_rank > 0
-            else {}
-        )
+        if self.model_config.lora_rank > 0:
+            multi_lora = getattr(self.model_config, "multi_lora", False)
+            from verl.workers.rollout.vllm_rollout.utils import MULTI_LORA_MAX_ADAPTERS
+            max_loras = MULTI_LORA_MAX_ADAPTERS if multi_lora else 1
+            self.lora_config = {
+                "max_loras": max_loras,
+                "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
+            }
+        else:
+            self.lora_config = {}
 
         if config.layered_summon or (config.expert_parallel_size > 1 and not _check_vllm_version_for_sleep_level()):
             logger.warning("Setting the sleep level to 1 may cause a memory overflow.")
@@ -261,19 +266,45 @@ class vLLMAsyncRollout(BaseRollout):
             weights: A generator that yields the name of the weight tensor and the tensor itself.
         """
         peft_config, base_sync_done = kwargs.get("peft_config", None), kwargs.get("base_sync_done", False)
+        adapter_name = kwargs.get("adapter_name", None)
+
         if peft_config and base_sync_done:
-            # In async mode, make sure the old lora is removed before adding the new one
-            self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
-            weights = dict(weights)
-            lora_request = TensorLoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
-                lora_path=VLLM_LORA_PATH,
-                peft_config=asdict(peft_config),
-                lora_tensors=weights,
-            )
-            self.inference_engine.worker.add_lora(lora_request)
-            logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
+            if adapter_name is not None:
+                # Multi-LoRA mode: load a specific role's adapter by name.
+                from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+                role_info = ROLE_LORA_REGISTRY.get(adapter_name)
+                if role_info is None:
+                    raise ValueError(
+                        f"Unknown adapter '{adapter_name}'. "
+                        f"Available: {list(ROLE_LORA_REGISTRY.keys())}"
+                    )
+                try:
+                    self.inference_engine.worker.remove_lora(role_info["int_id"])
+                except Exception:
+                    pass  # Adapter may not exist yet on first load.
+                weights = dict(weights)
+                lora_request = TensorLoRARequest(
+                    lora_name=role_info["name"],
+                    lora_int_id=role_info["int_id"],
+                    lora_path=role_info["path"],
+                    peft_config=asdict(peft_config),
+                    lora_tensors=weights,
+                )
+                self.inference_engine.worker.add_lora(lora_request)
+                logger.info(f"vLLM multi-lora: loaded adapter '{adapter_name}', params: {len(weights)}")
+            else:
+                # Single-adapter mode (backward compat).
+                self.inference_engine.worker.remove_lora(VLLM_LORA_INT_ID)
+                weights = dict(weights)
+                lora_request = TensorLoRARequest(
+                    lora_name=VLLM_LORA_NAME,
+                    lora_int_id=VLLM_LORA_INT_ID,
+                    lora_path=VLLM_LORA_PATH,
+                    peft_config=asdict(peft_config),
+                    lora_tensors=weights,
+                )
+                self.inference_engine.worker.add_lora(lora_request)
+                logger.info(f"vLLM load weights, loaded_params: {len(weights)}")
         else:
             from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 

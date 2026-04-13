@@ -87,6 +87,10 @@ class HFModelConfig(BaseConfig):
 
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None
+
+    # Multi-LoRA: create 5 per-role adapters (planner, executor, 3 tools) instead
+    # of a single "default" adapter.  Each adapter shares the same rank/alpha/targets.
+    multi_lora: bool = False
     use_liger: bool = False
 
     use_fused_kernels: bool = False

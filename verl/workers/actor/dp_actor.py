@@ -723,6 +723,9 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
+        # Preserve agent_name_list for multi-LoRA gradient routing
+        if "agent_name_list" in data.non_tensor_batch:
+            non_tensor_select_keys.append("agent_name_list")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 

@@ -433,6 +433,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
+        self._multi_lora = self._is_lora and self.config.model.get("multi_lora", False)
+
         if self._is_lora:
             print("Applying LoRA to actor module")
             actor_module.enable_input_require_grads()
@@ -463,6 +465,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     "bias": "none",
                 }
                 actor_module = get_peft_model(actor_module, LoraConfig(**lora_config))
+
+                if self._multi_lora:
+                    # Multi-LoRA: create 5 per-role adapters.
+                    # get_peft_model registered "default"; add 5 named adapters
+                    # then delete "default" (PEFT has no rename_adapter API).
+                    from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+                    role_names = list(ROLE_LORA_REGISTRY.keys())
+
+                    for role_name in role_names:
+                        actor_module.add_adapter(role_name, LoraConfig(**lora_config))
+                        if self.rank == 0:
+                            print(f"[multi-lora] Added adapter '{role_name}'")
+
+                    actor_module.delete_adapter("default")
+                    if self.rank == 0:
+                        print("[multi-lora] Deleted 'default' adapter")
+
+                    # Activate the first adapter so FSDP sees requires_grad correctly.
+                    actor_module.set_adapter(role_names[0])
+                    if self.rank == 0:
+                        print(f"[multi-lora] {len(role_names)} adapters created: {role_names}")
 
         self.use_orig_params = fsdp_config.get("use_orig_params", False)
         if self.config.actor.get("freeze_vision_tower", False):
@@ -686,7 +709,76 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        if hasattr(peft_model, "peft_config"):  # LoRA
+
+        # Multi-LoRA path: collect and sync each adapter separately.
+        if self._multi_lora and hasattr(peft_model, "peft_config"):
+            from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+            from verl.utils.fsdp_utils import collect_multi_lora_params
+
+            adapter_names = list(ROLE_LORA_REGISTRY.keys())
+            # Use the first adapter's peft_config (all share same config).
+            peft_config = next(iter(peft_model.peft_config.values()))
+
+            all_adapter_params = collect_multi_lora_params(
+                module=self.actor_module_fsdp,
+                adapter_names=adapter_names,
+                layered_summon=self.config.rollout.get("layered_summon", False),
+                base_sync_done=self.base_sync_done,
+            )
+
+            # Base model sync (only needed once on first rollout_mode call)
+            if not self.base_sync_done:
+                # Use any adapter for base model extraction.
+                peft_model.set_adapter(adapter_names[0])
+                base_params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.config.rollout.get("layered_summon", False),
+                    base_sync_done=False,
+                )
+                base_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_params.items()}
+                base_params = convert_weight_keys(
+                    base_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                )
+
+            log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+            set_expandable_segments(False)
+
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("After resume weights", logger=logger)
+
+            # Send base model weights first if not yet synced.
+            if not self.base_sync_done:
+                device = get_device_id()
+                per_tensor_base = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in base_params.items()
+                )
+                await self.rollout.update_weights(per_tensor_base, base_sync_done=False)
+                del base_params, per_tensor_base
+
+            # Send each adapter's LoRA weights.
+            for adapter_name, adapter_params in all_adapter_params.items():
+                adapter_params = convert_weight_keys(
+                    adapter_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                )
+                per_tensor = adapter_params.items() if isinstance(adapter_params, dict) else adapter_params
+                await self.rollout.update_weights(
+                    per_tensor,
+                    peft_config=peft_config,
+                    base_sync_done=True,  # base is synced (either already or just above)
+                    adapter_name=adapter_name,
+                )
+                logger.info(f"[multi-lora] Synced adapter '{adapter_name}' to vLLM")
+
+            log_gpu_memory_usage("After update_weights (multi-lora)", logger=logger)
+            del all_adapter_params
+
+        # Single-adapter LoRA path (backward compat).
+        elif hasattr(peft_model, "peft_config"):
             peft_config = peft_model.peft_config.get("default", None)
             params = collect_lora_params(
                 module=self.actor_module_fsdp,
@@ -695,59 +787,80 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             if not self.base_sync_done:
                 params = {replace_lora_wrapper(k, peft_config): v for k, v in params.items()}
+
+            params = convert_weight_keys(
+                params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            )
+
+            # Special handling for LoRA with sleep_level=2:
+            if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
+                base_model_params = collect_lora_params(
+                    module=self.actor_module_fsdp,
+                    layered_summon=self.layered_summon,
+                    base_sync_done=False,
+                )
+                base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
+                base_model_params = convert_weight_keys(
+                    base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                )
+
+            log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+            set_expandable_segments(False)
+
+            if peft_config is not None and self.base_sync_done:
+                per_tensor_param = params.items() if isinstance(params, dict) else params
+            else:
+                device = get_device_id()
+                per_tensor_param = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in params.items()
+                )
+
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("After resume weights", logger=logger)
+
+            if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
+                per_tensor_base_params = (
+                    (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                    for name, param in base_model_params.items()
+                )
+                await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
+                del base_model_params, per_tensor_base_params
+
+            await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+            log_gpu_memory_usage("After update_weights", logger=logger)
+            del params, per_tensor_param
+
+        # No LoRA: full model sync.
         else:
             params = self.actor_module_fsdp.state_dict()
-
-        params = convert_weight_keys(
-            params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
-        )
-
-        # Special handling for LoRA with sleep_level=2:
-        # When sleep_level=2, base model weights are destroyed during each sleep cycle.
-        # separately collect and update LoRA weights and base model weights through their respective interfaces.
-        # Here: params contains LoRA weights, base_model_params contains base model weights.
-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
-            base_model_params = collect_lora_params(
-                module=self.actor_module_fsdp,
-                layered_summon=self.layered_summon,
-                base_sync_done=False,
-            )
-            base_model_params = {replace_lora_wrapper(k, peft_config): v for k, v in base_model_params.items()}
-            base_model_params = convert_weight_keys(
-                base_model_params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+            params = convert_weight_keys(
+                params, getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
             )
 
-        log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+            log_gpu_memory_usage("Before offload_fsdp_model_to_cpu", logger=logger)
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload_fsdp_model_to_cpu", logger=logger)
+            set_expandable_segments(False)
 
-        set_expandable_segments(False)
-
-        if peft_config is not None and self.base_sync_done:
-            per_tensor_param = params.items() if isinstance(params, dict) else params  # Fixed: handle dict case
-        else:
-            device = get_device_id()  # used when fsdp2 set cpu_offload_policy
+            device = get_device_id()
             per_tensor_param = (
                 (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
                 for name, param in params.items()
             )
 
-        if self.config.rollout.free_cache_engine:
-            await self.rollout.resume(tags=["weights"])
-        log_gpu_memory_usage("After resume weights", logger=logger)
+            if self.config.rollout.free_cache_engine:
+                await self.rollout.resume(tags=["weights"])
+            log_gpu_memory_usage("After resume weights", logger=logger)
 
-        if peft_config is not None and getattr(self.rollout, "sleep_level", None) == 2:
-            per_tensor_base_params = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
-                for name, param in base_model_params.items()
-            )
-            await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
-            del base_model_params, per_tensor_base_params
-
-        await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
-        log_gpu_memory_usage("After update_weights", logger=logger)
-        del params, per_tensor_param
+            await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+            log_gpu_memory_usage("After update_weights", logger=logger)
+            del params, per_tensor_param
         aggressive_empty_cache(force_sync=True)
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
@@ -939,10 +1052,66 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
-            # perform training
-            with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
-            delta_time = timer.last
+
+            if self._multi_lora:
+                # Multi-LoRA: train each adapter on its own role's data.
+                # Iterate per-adapter with filtered data, accumulating metrics.
+                from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+                peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
+                agent_names = data.non_tensor_batch.get("agent_name_list")
+                all_metrics = {}
+                total_samples = 0
+
+                import numpy as np
+
+                with Timer(name="update_policy", logger=None) as timer:
+                    # Log role distribution for diagnostics.
+                    if agent_names is not None:
+                        known_mask = np.isin(agent_names, list(ROLE_LORA_REGISTRY.keys()))
+                        n_unknown = (~known_mask).sum()
+                        if n_unknown > 0:
+                            logger.warning(
+                                f"[multi-lora] Dropping {n_unknown}/{len(agent_names)} samples "
+                                f"with unrecognized agent_name"
+                            )
+
+                    for adapter_name in ROLE_LORA_REGISTRY:
+                        # Filter samples for this role.
+                        if agent_names is not None:
+                            mask = agent_names == adapter_name
+                            if not mask.any():
+                                continue
+                            indices = np.where(mask)[0].tolist()
+                            role_data = data.select_idxs(indices)
+                        else:
+                            # No agent_name metadata — fall back to training
+                            # all data with each adapter (degenerate case).
+                            role_data = data
+                            indices = list(range(len(data)))
+
+                        role_data.meta_info = dict(data.meta_info)
+                        peft_model.set_adapter(adapter_name)
+                        logger.info(f"[multi-lora] Training adapter '{adapter_name}' on {len(indices)} samples")
+                        role_metrics = self.actor.update_policy(data=role_data)
+
+                        n = len(indices)
+                        total_samples += n
+                        for k, v in role_metrics.items():
+                            if isinstance(v, (int, float)):
+                                all_metrics[k] = all_metrics.get(k, 0.0) + v * n
+
+                    # Weighted average of metrics across roles.
+                    if total_samples > 0:
+                        for k in all_metrics:
+                            all_metrics[k] /= total_samples
+                    metrics = all_metrics
+
+                delta_time = timer.last
+            else:
+                # Standard single-adapter training.
+                with Timer(name="update_policy", logger=None) as timer:
+                    metrics = self.actor.update_policy(data=data)
+                delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             images_seqlens = data.meta_info.get("images_seqlens", None)
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
@@ -1125,31 +1294,52 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
-            lora_save_path = os.path.join(local_path, "lora_adapter")
             peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
-            peft_config = {}
-            if dist.get_rank() == 0:
-                os.makedirs(lora_save_path, exist_ok=True)
-                peft_config = asdict(peft_model.peft_config.get("default", {}))
-                peft_config["task_type"] = peft_config["task_type"].value
-                peft_config["peft_type"] = peft_config["peft_type"].value
-                peft_config["target_modules"] = list(peft_config["target_modules"])
-            try:
-                if fsdp_version(self.actor_module_fsdp) > 0:
-                    self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
-                    lora_params = layered_summon_lora_params(self.actor_module_fsdp)
-                    if dist.get_rank() == 0:
-                        save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
-                        with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
-                            json.dump(peft_config, f, ensure_ascii=False, indent=4)
-            except Exception as e:
-                log_with_rank(
-                    f"Save LoRA Adapter Error ({e})", rank=dist.get_rank(), logger=logger, log_only_rank_0=True
-                )
+
+            if self._multi_lora:
+                # Multi-LoRA: save each adapter in its own subdirectory.
+                from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+                adapter_names = list(ROLE_LORA_REGISTRY.keys())
+            else:
+                # Single adapter: use "default" (or the first available key).
+                adapter_names = ["default"]
+
+            for adapter_name in adapter_names:
+                if self._multi_lora:
+                    lora_save_path = os.path.join(local_path, "lora_adapter", adapter_name)
+                else:
+                    lora_save_path = os.path.join(local_path, "lora_adapter")
+
+                peft_config = {}
+                if dist.get_rank() == 0:
+                    os.makedirs(lora_save_path, exist_ok=True)
+                    cfg = peft_model.peft_config.get(adapter_name, {})
+                    peft_config = asdict(cfg) if hasattr(cfg, "__dataclass_fields__") else dict(cfg)
+                    if "task_type" in peft_config and hasattr(peft_config["task_type"], "value"):
+                        peft_config["task_type"] = peft_config["task_type"].value
+                    if "peft_type" in peft_config and hasattr(peft_config["peft_type"], "value"):
+                        peft_config["peft_type"] = peft_config["peft_type"].value
+                    if "target_modules" in peft_config:
+                        peft_config["target_modules"] = list(peft_config["target_modules"])
+
+                try:
+                    if fsdp_version(self.actor_module_fsdp) > 0:
+                        self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
+                        peft_model.set_adapter(adapter_name)
+                        lora_params = layered_summon_lora_params(self.actor_module_fsdp)
+                        if dist.get_rank() == 0:
+                            save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
+                            with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
+                                json.dump(peft_config, f, ensure_ascii=False, indent=4)
+                except Exception as e:
+                    log_with_rank(
+                        f"Save LoRA Adapter Error for '{adapter_name}' ({e})",
+                        rank=dist.get_rank(), logger=logger, log_only_rank_0=True,
+                    )
 
             dist.barrier()
             log_with_rank(
-                f"[rank-{self.rank}]: Saved LoRA adapter to: {lora_save_path}",
+                f"[rank-{self.rank}]: Saved LoRA adapter(s) to: {os.path.join(local_path, 'lora_adapter')}",
                 rank=dist.get_rank(),
                 logger=logger,
                 log_only_rank_0=True,

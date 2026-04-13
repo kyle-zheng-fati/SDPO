@@ -20,6 +20,19 @@ VLLM_LORA_INT_ID = 123
 VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
 
+# Multi-LoRA role registry: maps each agent role to a unique vLLM adapter slot.
+# Used when multi_lora=True to serve 5 per-role LoRA adapters from one vLLM instance.
+ROLE_LORA_REGISTRY: dict[str, dict] = {
+    "planner":               {"int_id": 1, "name": "planner",               "path": "lora_planner"},
+    "executor":              {"int_id": 2, "name": "executor",              "path": "lora_executor"},
+    "Python_Coder_Tool":     {"int_id": 3, "name": "Python_Coder_Tool",     "path": "lora_python_coder"},
+    "Web_Search":            {"int_id": 4, "name": "Web_Search",            "path": "lora_web_search"},
+    "Wikipedia_Search_Tool": {"int_id": 5, "name": "Wikipedia_Search_Tool", "path": "lora_wikipedia"},
+}
+
+# Total number of adapters for vLLM max_loras config.
+MULTI_LORA_MAX_ADAPTERS = len(ROLE_LORA_REGISTRY)
+
 
 def get_vllm_max_lora_rank(lora_rank: int):
     """

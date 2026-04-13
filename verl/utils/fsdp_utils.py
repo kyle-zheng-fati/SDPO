@@ -666,6 +666,56 @@ def collect_lora_params(module: FSDP, layered_summon: bool, base_sync_done: bool
     return lora_params
 
 
+def collect_multi_lora_params(
+    module: FSDP,
+    adapter_names: list[str],
+    layered_summon: bool,
+    base_sync_done: bool,
+) -> dict[str, OrderedDict]:
+    """Collect LoRA params for each named adapter in a multi-LoRA model.
+
+    Args:
+        module: FSDP-wrapped PeftModel with multiple named adapters.
+        adapter_names: List of adapter names (e.g. ["planner", "executor", ...]).
+        layered_summon: Use memory-efficient layered summoning.
+        base_sync_done: Whether the base model is already loaded in vLLM.
+
+    Returns:
+        Dict mapping adapter_name -> OrderedDict of LoRA param tensors.
+    """
+    from peft.utils.save_and_load import get_peft_model_state_dict
+
+    peft_model = getattr(module, "_fsdp_wrapped_module", module)
+    all_adapters: dict[str, OrderedDict] = {}
+
+    for adapter_name in adapter_names:
+        peft_model.set_adapter(adapter_name)
+        if base_sync_done:
+            # Extract only this adapter's LoRA weights.
+            # Must pass adapter_name explicitly — "default" no longer exists.
+            if fsdp_version(module) > 0:
+                if layered_summon:
+                    params = layered_summon_lora_params(module)
+                else:
+                    with FSDP.summon_full_params(module, writeback=False):
+                        params = get_peft_model_state_dict(peft_model, adapter_name=adapter_name)
+                        params = OrderedDict({
+                            k: v.full_tensor().detach().cpu() if hasattr(v, "full_tensor") else v.detach().cpu()
+                            for k, v in params.items()
+                        })
+                    get_torch_device().empty_cache()
+            else:
+                params = get_peft_model_state_dict(peft_model, adapter_name=adapter_name)
+        else:
+            # Base model extraction — delegate to single-adapter path
+            # (base model weights are shared across all adapters).
+            params = collect_lora_params(module, layered_summon, base_sync_done)
+
+        all_adapters[adapter_name] = params
+
+    return all_adapters
+
+
 def replace_lora_wrapper(k, peft_config):
     """Replace LoRA parameter keys with base layer equivalents.
 
