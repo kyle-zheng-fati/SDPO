@@ -587,6 +587,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         log_gpu_memory_usage(f"After {role} FSDP init", logger=logger)
 
+        # Release freed memory from full-model loading back to CUDA.
+        # Without this, PyTorch's allocator hoards the ~17GB freed when
+        # FSDP shards the model, preventing the internal vLLM from
+        # allocating on the same GPU.
+        import gc
+        gc.collect()
+        get_torch_device().empty_cache()
+        log_gpu_memory_usage(f"After {role} FSDP empty_cache", logger=logger)
+
         # TODO: add more optimizer args into config
         if role == "actor" and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
@@ -2214,11 +2223,25 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def wake_up(self):
+        # When using a standalone vLLM server for rollouts (VLLM_BASE_URL set),
+        # skip the expensive weight sync to internal vLLM. The all-gather
+        # temporarily materializes the full model (~16GB for 8B) on each GPU,
+        # which OOMs on A100-40GB where FSDP + internal vLLM already use ~22GB.
+        # With standalone vLLM, rollouts use base model weights anyway (no LoRA
+        # sync), so this weight copy is pure waste.
+        import os
+        if os.environ.get("SKIP_INTERNAL_VLLM_SYNC", ""):
+            logger.info("Skipping wake_up weight sync (SKIP_INTERNAL_VLLM_SYNC set)")
+            return True
         await self.rollout_mode()
         return True
 
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def sleep(self):
+        import os
+        if os.environ.get("SKIP_INTERNAL_VLLM_SYNC", ""):
+            logger.info("Skipping sleep (SKIP_INTERNAL_VLLM_SYNC set)")
+            return True
         await self.trainer_mode()
         return True
 
