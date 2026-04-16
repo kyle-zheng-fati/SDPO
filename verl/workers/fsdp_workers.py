@@ -972,59 +972,74 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
 
         if self._is_ref:
-            ref_model_path = self.config.model.path
-            ref_model = self.config.ref.get("model", None)
-            if ref_model is not None:
-                ref_model_path = ref_model.get("path", self.config.model.path)
-
-            if self.rank == 0:
-                print("reference model:", ref_model_path)
-            local_path = copy_to_local(ref_model_path, use_shm=use_shm)
-            use_prefix_grouper = hasattr(self.config, "actor") and self.config.actor.get("use_prefix_grouper", False)
-
-            # TiledMLP for ref model: use ref config if specified, otherwise use actor config
-            ref_tiled_mlp_config = self.config.ref.get("tiled_mlp", None)
-            if ref_tiled_mlp_config is None:
-                ref_tiled_mlp_config = self.config.model.get("tiled_mlp", {})
-            ref_use_tiled_mlp = ref_tiled_mlp_config.get("enabled", False)
-            ref_tiled_mlp_shards = ref_tiled_mlp_config.get("num_shards", 4)
-
-            self.ref_module_fsdp = self._build_model_optimizer(
-                model_path=local_path,
-                fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
-                optim_config=None,
-                override_model_config=override_model_config,
-                use_remove_padding=use_remove_padding,
-                use_fused_kernels=use_fused_kernels,
-                trust_remote_code=self.config.model.get("trust_remote_code", False),
-                use_liger=self.config.model.get("use_liger", False),
-                role="ref",
-                use_prefix_grouper=use_prefix_grouper,
-                use_tiled_mlp=ref_use_tiled_mlp,
-                tiled_mlp_shards=ref_tiled_mlp_shards,
-            )[0]
-            OmegaConf.set_struct(self.config.ref, True)
-            with open_dict(self.config.ref):
-                self.config.ref.use_remove_padding = use_remove_padding
-                self.config.ref.use_fused_kernels = use_fused_kernels
-                if use_prefix_grouper:
-                    self.config.ref.use_prefix_grouper = use_prefix_grouper
-            self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
-            if getattr(self, "tokenizer", None) is not None:
-                self.ref_policy.tokenizer = self.tokenizer
-            if self._is_actor:
-                self_distillation_cfg = self.config.actor.get("self_distillation", None)
+            # With LoRA, the actor without adapters IS the reference model.
+            # compute_ref_log_prob() handles this via disable_adapter() — no
+            # separate ref model needed.  Only load one if SDPO requires it
+            # for the teacher module.
+            _needs_separate_ref = not self._is_lora
+            if self._is_lora and self._is_actor:
                 loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
-                if self_distillation_cfg is not None and loss_mode == "sdpo":
-                    teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
-                    if teacher_regularization == "trust-region":
-                        self.actor.teacher_module = TrustRegionTeacher(
-                            ref_module=self.ref_module_fsdp,
-                            student_module=self.actor_module_fsdp,
-                            mix_coef=self_distillation_cfg.get("teacher_update_rate", 0.0),
-                        )
-                    else:
-                        self.actor.teacher_module = self.ref_module_fsdp
+                sdpo_cfg = self.config.actor.get("self_distillation", None)
+                if sdpo_cfg is not None and loss_mode == "sdpo":
+                    _needs_separate_ref = True
+
+            if _needs_separate_ref:
+                ref_model_path = self.config.model.path
+                ref_model = self.config.ref.get("model", None)
+                if ref_model is not None:
+                    ref_model_path = ref_model.get("path", self.config.model.path)
+
+                if self.rank == 0:
+                    print("reference model:", ref_model_path)
+                local_path = copy_to_local(ref_model_path, use_shm=use_shm)
+                use_prefix_grouper = hasattr(self.config, "actor") and self.config.actor.get("use_prefix_grouper", False)
+
+                # TiledMLP for ref model: use ref config if specified, otherwise use actor config
+                ref_tiled_mlp_config = self.config.ref.get("tiled_mlp", None)
+                if ref_tiled_mlp_config is None:
+                    ref_tiled_mlp_config = self.config.model.get("tiled_mlp", {})
+                ref_use_tiled_mlp = ref_tiled_mlp_config.get("enabled", False)
+                ref_tiled_mlp_shards = ref_tiled_mlp_config.get("num_shards", 4)
+
+                self.ref_module_fsdp = self._build_model_optimizer(
+                    model_path=local_path,
+                    fsdp_config=omega_conf_to_dataclass(self.config.ref.fsdp_config),
+                    optim_config=None,
+                    override_model_config=override_model_config,
+                    use_remove_padding=use_remove_padding,
+                    use_fused_kernels=use_fused_kernels,
+                    trust_remote_code=self.config.model.get("trust_remote_code", False),
+                    use_liger=self.config.model.get("use_liger", False),
+                    role="ref",
+                    use_prefix_grouper=use_prefix_grouper,
+                    use_tiled_mlp=ref_use_tiled_mlp,
+                    tiled_mlp_shards=ref_tiled_mlp_shards,
+                )[0]
+                OmegaConf.set_struct(self.config.ref, True)
+                with open_dict(self.config.ref):
+                    self.config.ref.use_remove_padding = use_remove_padding
+                    self.config.ref.use_fused_kernels = use_fused_kernels
+                    if use_prefix_grouper:
+                        self.config.ref.use_prefix_grouper = use_prefix_grouper
+                self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+                if getattr(self, "tokenizer", None) is not None:
+                    self.ref_policy.tokenizer = self.tokenizer
+                if self._is_actor:
+                    self_distillation_cfg = self.config.actor.get("self_distillation", None)
+                    loss_mode = self.config.actor.policy_loss.get("loss_mode", "vanilla")
+                    if self_distillation_cfg is not None and loss_mode == "sdpo":
+                        teacher_regularization = self_distillation_cfg.get("teacher_regularization", "ema")
+                        if teacher_regularization == "trust-region":
+                            self.actor.teacher_module = TrustRegionTeacher(
+                                ref_module=self.ref_module_fsdp,
+                                student_module=self.actor_module_fsdp,
+                                mix_coef=self_distillation_cfg.get("teacher_update_rate", 0.0),
+                            )
+                        else:
+                            self.actor.teacher_module = self.ref_module_fsdp
+            else:
+                if self.rank == 0:
+                    print("LoRA mode: skipping separate ref model (actor base weights used as reference)")
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
