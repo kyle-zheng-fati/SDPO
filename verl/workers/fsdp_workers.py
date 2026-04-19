@@ -1312,13 +1312,52 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
+        # LoRA training: skip the redundant FSDP-sharded base-model write
+        # (~30 GB / step for an 8B base + LoRA r=16 across 4 ranks). The
+        # LoRA adapter(s) are saved separately below in PEFT format
+        # (adapter_model.safetensors + adapter_config.json), which is
+        # exactly what vLLM's --enable-lora / load_lora_adapter expects.
+        # Opt back into the full base shard via config:
+        #   actor_rollout_ref.actor.checkpoint.save_base_with_lora=true
+        # (default false). Optimizer + extra state still saved normally so
+        # resume of the LoRA delta + lr_scheduler + RNG works as before.
+        save_base_with_lora = False
+        if self._is_lora:
+            try:
+                save_base_with_lora = bool(
+                    self.config.actor.checkpoint.get("save_base_with_lora", False)
+                )
+            except Exception:
+                save_base_with_lora = False
+        save_model_kwarg = {} if not self._is_lora else {"save_model": save_base_with_lora}
         self.checkpoint_manager.save_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            global_step=global_step,
+            max_ckpt_to_keep=max_ckpt_to_keep,
+            **save_model_kwarg,
         )
         dist.barrier()
 
-        if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
-            peft_model = getattr(self, "actor_module", self.actor_module_fsdp)
+        # ---- LoRA adapter save loop ----
+        # SAFETY INVARIANT (paired with save_model=False above): when LoRA is
+        # active and we skip the base shards, this loop is the ONLY thing that
+        # writes recoverable trained weights. If it silently does nothing (empty
+        # gather, all adapters fail in their try/except, peft_config missing),
+        # the checkpoint dir contains only optimizer/extra/tokenizer — useless
+        # for resume and we lose every step of training. The save_failures
+        # tracker + post-loop assert turn that silent loss into a hard crash
+        # at the source so we notice immediately.
+        if self._is_lora:
+            actor_for_peft = getattr(self, "actor_module", self.actor_module_fsdp)
+            assert hasattr(actor_for_peft, "peft_config"), (
+                "_is_lora=True but actor_module has no peft_config — PEFT init "
+                "must have failed silently. Refusing to save: with save_model="
+                f"{save_base_with_lora} the only weight-bearing artifact would "
+                "be the LoRA loop, and there is no LoRA to save. Investigate "
+                "the actor init at fsdp_workers.py:438+."
+            )
+            peft_model = actor_for_peft
 
             if self._multi_lora:
                 # Multi-LoRA: save each adapter in its own subdirectory.
@@ -1327,6 +1366,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             else:
                 # Single adapter: use "default" (or the first available key).
                 adapter_names = ["default"]
+
+            saved_adapters: list[str] = []
+            adapter_errors: dict[str, str] = {}
 
             for adapter_name in adapter_names:
                 if self._multi_lora:
@@ -1351,19 +1393,54 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
                         peft_model.set_adapter(adapter_name)
                         lora_params = layered_summon_lora_params(self.actor_module_fsdp)
+                        # Defend against silent corruption: layered_summon_lora_params
+                        # returns an empty OrderedDict (no error) if FSDP wraps the
+                        # module under a path not in its hardcoded prefix_list. Writing
+                        # a 0-key safetensors looks like success but silently destroys
+                        # the trained delta. Fail loudly instead.
+                        if not lora_params:
+                            raise RuntimeError(
+                                f"layered_summon_lora_params returned empty for adapter "
+                                f"'{adapter_name}'. FSDP/PEFT path mismatch in "
+                                f"verl/utils/fsdp_utils.py:569 (prefix_list). Refusing "
+                                f"to write 0-key safetensors."
+                            )
                         if dist.get_rank() == 0:
                             save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
                             with open(os.path.join(lora_save_path, "adapter_config.json"), "w", encoding="utf-8") as f:
                                 json.dump(peft_config, f, ensure_ascii=False, indent=4)
+                        saved_adapters.append(adapter_name)
                 except Exception as e:
+                    adapter_errors[adapter_name] = f"{type(e).__name__}: {e}"
                     log_with_rank(
                         f"Save LoRA Adapter Error for '{adapter_name}' ({e})",
                         rank=dist.get_rank(), logger=logger, log_only_rank_0=True,
                     )
 
             dist.barrier()
+
+            # Post-loop guard: if EVERY adapter failed, and we also skipped the
+            # base shard write (save_base_with_lora=False), the checkpoint is
+            # weightless — silent training-loss disaster on resume. Crash now.
+            if not saved_adapters and not save_base_with_lora:
+                raise RuntimeError(
+                    f"LoRA checkpoint at {local_path} has no saved adapters AND "
+                    f"base shards were skipped (save_base_with_lora=False). The "
+                    f"checkpoint is weightless. Per-adapter errors: {adapter_errors}. "
+                    f"To recover, set actor_rollout_ref.actor.checkpoint."
+                    f"save_base_with_lora=true and re-launch (or fix the underlying "
+                    f"FSDP/PEFT issue)."
+                )
+            if adapter_errors and self.rank == 0:
+                log_with_rank(
+                    f"[WARNING] {len(adapter_errors)}/{len(adapter_names)} LoRA "
+                    f"adapter(s) failed to save: {list(adapter_errors)}. Saved: "
+                    f"{saved_adapters}.",
+                    rank=self.rank, logger=logger, log_only_rank_0=True,
+                )
             log_with_rank(
-                f"[rank-{self.rank}]: Saved LoRA adapter(s) to: {os.path.join(local_path, 'lora_adapter')}",
+                f"[rank-{self.rank}]: Saved {len(saved_adapters)} LoRA adapter(s) "
+                f"to: {os.path.join(local_path, 'lora_adapter')}",
                 rank=dist.get_rank(),
                 logger=logger,
                 log_only_rank_0=True,
@@ -1390,8 +1467,55 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
+        # LoRA resume strategy (auto-detect, with hard fail on ambiguity):
+        #
+        # The base-model FSDP shards (`model_world_size_*_rank_*.pt`) used to
+        # carry the LoRA delta inline (PEFT-wrapped weights captured by FSDP's
+        # state_dict). With save_base_with_lora=false (the new default for
+        # LoRA), those shards are no longer written, and the trained LoRA
+        # delta lives only at <ckpt>/lora_adapter/. verl currently has no
+        # FSDP-aware LoRA reload helper (the save uses layered_summon_lora_params
+        # but there is no inverse "scatter" path), so the trained delta is NOT
+        # auto-loaded by the checkpoint manager on resume — it must be wired
+        # in via the existing init-time PEFT path (model.lora_adapter_path).
+        #
+        # We therefore:
+        #   (a) Detect whether base shards are present (pre-patch checkpoints
+        #       still have them — load normally, no behavior change).
+        #   (b) If absent, skip the model-load branch (avoid FileNotFound).
+        #       And if model.lora_adapter_path is also unset, fail HARD with
+        #       the exact remedy — never silently train from a random LoRA.
+        load_model_kwarg = {}
+        if self._is_lora:
+            base_shard_path = os.path.join(
+                local_path,
+                f"model_world_size_{self.world_size}_rank_{self.rank}.pt",
+            )
+            if not os.path.exists(base_shard_path):
+                load_model_kwarg = {"load_model": False}
+                lora_dir = os.path.join(local_path, "lora_adapter")
+                configured_lora_path = self.config.model.get("lora_adapter_path")
+                if configured_lora_path is None and os.path.isdir(lora_dir):
+                    raise RuntimeError(
+                        f"LoRA resume from {local_path}: base-model shards are "
+                        f"absent (checkpoint was saved with save_base_with_lora=false) "
+                        f"and actor_rollout_ref.model.lora_adapter_path is unset. "
+                        f"verl does not yet auto-load the trained LoRA delta from "
+                        f"the checkpoint's lora_adapter/ on resume.\n"
+                        f"Remedy (pick one):\n"
+                        f"  1. Edit your hydra config to add "
+                        f"actor_rollout_ref.model.lora_adapter_path={lora_dir} "
+                        f"and re-launch (init-time PEFT will load the trained delta).\n"
+                        f"  2. Re-launch training fresh and set "
+                        f"actor_rollout_ref.actor.checkpoint.save_base_with_lora=true "
+                        f"so future checkpoints carry the base shards (loses the "
+                        f"~30 GB/step disk savings)."
+                    )
         self.checkpoint_manager.load_checkpoint(
-            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+            local_path=local_path,
+            hdfs_path=hdfs_path,
+            del_local_after_load=del_local_after_load,
+            **load_model_kwarg,
         )
 
         if self._is_offload_param:

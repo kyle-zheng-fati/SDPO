@@ -394,7 +394,13 @@ class vLLMHttpServer:
         distributed_executor_backend = ExternalZeroMQDistributedExecutor if len(self.workers) > 0 else None
         server_args.distributed_executor_backend = distributed_executor_backend
 
-        zmq_addresses = ray.get([worker.get_zeromq_address.remote() for worker in self.workers])
+        # 2026-04-16: wrap blocking ray.get in asyncio.to_thread so the async actor's
+        # event loop stays free to send Ray heartbeats. Without this, the actor was
+        # killed by Ray's heartbeat watchdog during init, leaving the HTTP port unbound.
+        zmq_addresses = await asyncio.to_thread(
+            ray.get,
+            [worker.get_zeromq_address.remote() for worker in self.workers],
+        )
         logger.info(
             f"replica_rank={self.replica_rank}, node_rank={self.node_rank}, nnodes={self.nnodes}, "
             f"get worker zmq addresses: {zmq_addresses}"
@@ -420,7 +426,17 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
-        engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+        # 2026-04-16: AsyncLLM.from_vllm_config is a synchronous constructor whose
+        # internal MPClient.__init__ does a blocking ZMQ poll waiting for EngineCore
+        # READY. Inside an async Ray actor this blocks the event loop, Ray heartbeat
+        # fails, the actor is killed, and uvicorn (line 437) is never reached.
+        # asyncio.to_thread runs it in a thread; the event loop stays responsive.
+        engine_client = await asyncio.to_thread(
+            AsyncLLM.from_vllm_config,
+            vllm_config=vllm_config,
+            usage_context=usage_context,
+            **kwargs,
+        )
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
