@@ -449,11 +449,65 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 # Copy adapter to local if needed
                 local_adapter_path = copy_to_local(lora_adapter_path, use_shm=self.config.model.get("use_shm", False))
 
-                actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
-                peft_config = actor_module.peft_config["default"]
-                # Ensure task_type is TaskType enum, not string
-                if isinstance(peft_config.task_type, str):
-                    peft_config.task_type = TaskType.CAUSAL_LM
+                if self._multi_lora:
+                    # Multi-LoRA resume: `lora_adapter_path` is treated as a
+                    # PARENT directory containing one subdirectory per role
+                    # (e.g. <ckpt>/global_step_N/actor/lora_adapter/).
+                    #
+                    # Pre-fix behavior loaded a single adapter via
+                    # `PeftModel.from_pretrained(..., peft_config["default"])`
+                    # and silently left 4/5 role adapters at random init — a
+                    # catastrophic silent regression. We now auto-scan the
+                    # parent for every expected registry key, hard-fail if any
+                    # are missing, then load them in order.
+                    from verl.workers.rollout.vllm_rollout.utils import (
+                        ROLE_LORA_REGISTRY,
+                        resolve_multi_lora_resume_paths,
+                    )
+
+                    role_names = list(ROLE_LORA_REGISTRY.keys())
+                    resolved = resolve_multi_lora_resume_paths(local_adapter_path, role_names)
+
+                    first_name, first_path = resolved[0]
+                    actor_module = PeftModel.from_pretrained(
+                        actor_module,
+                        first_path,
+                        adapter_name=first_name,
+                        is_trainable=True,
+                    )
+                    if self.rank == 0:
+                        print(f"[multi-lora] Loaded adapter '{first_name}' from {first_path}")
+
+                    for name, path in resolved[1:]:
+                        actor_module.load_adapter(
+                            path,
+                            adapter_name=name,
+                            is_trainable=True,
+                        )
+                        if self.rank == 0:
+                            print(f"[multi-lora] Loaded adapter '{name}' from {path}")
+
+                    # If PEFT auto-registered a "default" adapter during
+                    # from_pretrained (parity with the from-scratch branch
+                    # above), delete it so only the per-role adapters remain.
+                    if "default" in actor_module.peft_config and "default" not in role_names:
+                        actor_module.delete_adapter("default")
+                        if self.rank == 0:
+                            print("[multi-lora] Deleted auto-created 'default' adapter")
+
+                    # Activate the first adapter (mirrors the from-scratch branch).
+                    actor_module.set_adapter(first_name)
+
+                    # Normalize task_type on every adapter config.
+                    for adapter_cfg in actor_module.peft_config.values():
+                        if isinstance(adapter_cfg.task_type, str):
+                            adapter_cfg.task_type = TaskType.CAUSAL_LM
+                else:
+                    actor_module = PeftModel.from_pretrained(actor_module, local_adapter_path, is_trainable=True)
+                    peft_config = actor_module.peft_config["default"]
+                    # Ensure task_type is TaskType enum, not string
+                    if isinstance(peft_config.task_type, str):
+                        peft_config.task_type = TaskType.CAUSAL_LM
 
             else:
                 # Convert config to regular Python types before creating PEFT model

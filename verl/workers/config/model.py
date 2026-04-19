@@ -85,7 +85,20 @@ class HFModelConfig(BaseConfig):
     # megatron lora config
     lora: dict[str, Any] = field(default_factory=dict)
 
-    # path to pre-trained LoRA adapter to load for continued training
+    # path to pre-trained LoRA adapter to load for continued training.
+    #
+    # Single-LoRA (multi_lora=False): the path must be a single adapter
+    # directory containing adapter_model.safetensors + adapter_config.json
+    # (loaded via PeftModel.from_pretrained and exposed as "default").
+    #
+    # Multi-LoRA (multi_lora=True): the path is treated as a PARENT
+    # directory with one subdirectory per role (planner/, executor/, ...)
+    # — typically point this at
+    # <ckpt>/global_step_N/actor/lora_adapter/. The resume path in
+    # ActorRolloutRefWorker auto-scans every key in
+    # ROLE_LORA_REGISTRY under this parent; if ANY expected subdir is
+    # missing, it raises a RuntimeError rather than silently leaving
+    # adapters at random init.
     lora_adapter_path: Optional[str] = None
 
     # Multi-LoRA: create 5 per-role adapters (planner, executor, 3 tools) instead
