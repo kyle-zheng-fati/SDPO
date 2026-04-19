@@ -80,6 +80,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
+from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask, convert_weight_keys
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
@@ -1120,14 +1121,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
                         n = len(indices)
                         total_samples += n
-                        for k, v in role_metrics.items():
-                            if isinstance(v, (int, float)):
-                                all_metrics[k] = all_metrics.get(k, 0.0) + v * n
+                        # update_policy returns list-valued metrics (via append_to_dict);
+                        # reduce to scalars so the old isinstance(v, (int, float)) guard
+                        # no longer silently drops pg_loss/kl_loss/entropy/grad_norm/etc.
+                        role_reduced = reduce_metrics(role_metrics)
+                        for k, v in role_reduced.items():
+                            # Per-role key, e.g. "actor/pg_loss" -> "actor/planner/pg_loss".
+                            per_role_key = (
+                                k.replace("actor/", f"actor/{adapter_name}/", 1)
+                                if k.startswith("actor/") else f"{adapter_name}/{k}"
+                            )
+                            all_metrics[per_role_key] = v
+                            # Back-compat aggregate under the original key (weighted sum,
+                            # normalized below). Preserves the pre-fix wandb contract.
+                            all_metrics[k] = all_metrics.get(k, 0.0) + v * n
 
-                    # Weighted average of metrics across roles.
+                    # Weighted-mean only the aggregate (non-per-role) keys.
+                    role_names = set(ROLE_LORA_REGISTRY.keys())
                     if total_samples > 0:
                         for k in all_metrics:
-                            all_metrics[k] /= total_samples
+                            parts = k.split("/")
+                            is_per_role_key = len(parts) >= 2 and parts[1] in role_names
+                            if not is_per_role_key:
+                                all_metrics[k] /= total_samples
                     metrics = all_metrics
 
                 delta_time = timer.last
