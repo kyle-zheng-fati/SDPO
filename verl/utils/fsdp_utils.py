@@ -20,6 +20,7 @@ import os
 from abc import ABC
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -566,7 +567,37 @@ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinit
     return total_norm
 
 
-def layered_summon_lora_params(fsdp_module) -> OrderedDict:
+def layered_summon_lora_params(
+    fsdp_module,
+    adapter_name: Optional[str] = None,
+) -> OrderedDict:
+    """Collect LoRA params by layered FSDP ``summon_full_params`` over submodules.
+
+    Multi-LoRA contract (IMPORTANT):
+        When the underlying ``PeftModel`` has multiple named adapters, the caller
+        MUST pass ``adapter_name`` explicitly. ``peft.utils.save_and_load.
+        get_peft_model_state_dict`` defaults to ``adapter_name='default'`` when
+        the kwarg is omitted; under FSDP sharding, relying on ``set_adapter``
+        alone is NOT sufficient because the active adapter flag does not always
+        propagate through every FSDP-wrapped submodule by the time layered
+        summoning runs. Omitting ``adapter_name`` in a multi-LoRA model causes
+        cross-adapter contamination (the same adapter's deltas get written
+        under every adapter's filename — a silent 5x duplication bug).
+
+    Args:
+        fsdp_module: FSDP-wrapped ``PeftModel`` (or raw ``PeftModel`` on single-device).
+        adapter_name: Name of the adapter whose LoRA params to collect.
+            - ``None`` (default): preserve legacy single-LoRA behavior; PEFT's
+              default ``'default'`` adapter will be selected by
+              ``get_peft_model_state_dict``.
+            - Any string: extract ONLY that adapter's weights. This is
+              REQUIRED for correctness when ``PeftModel`` holds multiple
+              adapters (multi-LoRA training).
+
+    Returns:
+        OrderedDict mapping prefixed parameter names to CPU tensors for the
+        selected adapter.
+    """
     from peft.utils.save_and_load import get_peft_model_state_dict
 
     def __prefix_submodules(module, prefix):
@@ -588,6 +619,10 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
         "base_model.model.model.language_model.layers.",
     ]
     peft_model = getattr(fsdp_module, "_fsdp_wrapped_module", fsdp_module)
+    # Build the kwarg dict once so we only forward adapter_name when the caller
+    # explicitly passed one. This preserves backward-compat with pre-existing
+    # single-LoRA callers that never needed the kwarg.
+    gpmsd_kwargs = {"adapter_name": adapter_name} if adapter_name is not None else {}
     for prefix in prefix_list:
         for name, submodule in __prefix_submodules(fsdp_module, prefix):
             prefix = name.replace("_fsdp_wrapped_module.base_model.model.", "base_model.model.")
@@ -595,7 +630,11 @@ def layered_summon_lora_params(fsdp_module) -> OrderedDict:
                 continue
             if fsdp_version(submodule) > 0:
                 with FSDP.summon_full_params(submodule, writeback=False):
-                    sub_lora_params = get_peft_model_state_dict(peft_model, state_dict=submodule.state_dict())
+                    sub_lora_params = get_peft_model_state_dict(
+                        peft_model,
+                        state_dict=submodule.state_dict(),
+                        **gpmsd_kwargs,
+                    )
                     sub_lora_params = {
                         f"{prefix}.{name}": param.full_tensor().detach().cpu()
                         if hasattr(param, "full_tensor")
@@ -695,7 +734,12 @@ def collect_multi_lora_params(
             # Must pass adapter_name explicitly — "default" no longer exists.
             if fsdp_version(module) > 0:
                 if layered_summon:
-                    params = layered_summon_lora_params(module)
+                    # Pass adapter_name explicitly so that PEFT's
+                    # get_peft_model_state_dict filters to THIS adapter's
+                    # weights, not whichever adapter set_adapter happened to
+                    # leave active on every FSDP-wrapped submodule. Multi-LoRA
+                    # correctness depends on this kwarg.
+                    params = layered_summon_lora_params(module, adapter_name=adapter_name)
                 else:
                     with FSDP.summon_full_params(module, writeback=False):
                         params = get_peft_model_state_dict(peft_model, adapter_name=adapter_name)

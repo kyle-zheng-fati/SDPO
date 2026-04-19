@@ -1407,8 +1407,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 try:
                     if fsdp_version(self.actor_module_fsdp) > 0:
                         self.actor_module_fsdp = self.actor_module_fsdp.to(get_device_name())
+                        # Belt-and-suspenders: set_adapter flips PeftModel's
+                        # active_adapter flag (read by some downstream code),
+                        # while the adapter_name kwarg below forces
+                        # get_peft_model_state_dict to filter this adapter's
+                        # weights even if the FSDP-wrapped submodules have not
+                        # yet propagated the active_adapter change. Without
+                        # the kwarg, every adapter's file on disk silently
+                        # contained the same (active-at-save-time) adapter's
+                        # deltas — a 5x cross-adapter duplication bug.
                         peft_model.set_adapter(adapter_name)
-                        lora_params = layered_summon_lora_params(self.actor_module_fsdp)
+                        lora_params = layered_summon_lora_params(
+                            self.actor_module_fsdp, adapter_name=adapter_name
+                        )
                         # Defend against silent corruption: layered_summon_lora_params
                         # returns an empty OrderedDict (no error) if FSDP wraps the
                         # module under a path not in its hardcoded prefix_list. Writing
