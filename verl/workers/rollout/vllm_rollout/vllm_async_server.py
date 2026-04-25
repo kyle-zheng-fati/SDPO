@@ -457,6 +457,11 @@ class vLLMHttpServer:
         # dict. We insert here, with placeholder paths — the path is never read
         # because the actual weights come from verl's TensorLoRARequest in
         # add_lora() during weight-sync, keyed by lora_int_id.
+        #
+        # See `.planning/ISSUES.md` ISSUE-026 for the full diagnosis (and the
+        # reverted Option A `--lora-modules` attempt at SHA `e81f97a`).
+        # Validated by `tests/smoke_multi_lora_registry.py`, which exercises
+        # the same dict-insert via `/v1/load_lora_adapter` REST.
         if getattr(self.model_config, "multi_lora", False):
             from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
             from vllm.lora.request import LoRARequest as _LoRARequest
