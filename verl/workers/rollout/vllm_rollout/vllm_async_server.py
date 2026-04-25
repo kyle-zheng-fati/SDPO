@@ -373,22 +373,6 @@ class vLLMHttpServer:
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
 
-        # Multi-LoRA: register adapter names with the OpenAI HTTP server.
-        # The args.update above sets enable_lora=True at the engine level, but
-        # served_model_names (what /v1/chat/completions checks for model=<X>)
-        # is only populated by --lora-modules at startup. Without this, every
-        # rollout request model="planner" returns 404 even though adapters
-        # are registered via add_lora() at runtime.
-        if self.model_config.lora_rank > 0 and getattr(self.model_config, "multi_lora", False):
-            from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
-            for _role, _info in ROLE_LORA_REGISTRY.items():
-                server_args.extend(["--lora-modules", f"{_role}={_info['path']}"])
-            if self.replica_rank == 0:
-                logger.info(
-                    f"[multi-lora] Registered {len(ROLE_LORA_REGISTRY)} adapter names "
-                    f"with vLLM OpenAI server: {list(ROLE_LORA_REGISTRY.keys())}"
-                )
-
         if self.replica_rank == 0:
             pprint(server_args)
 
