@@ -449,6 +449,31 @@ class vLLMHttpServer:
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
 
+        # Multi-LoRA: register adapter NAMES with vLLM's OpenAI server registry
+        # so that /v1/chat/completions accepts model=<role> as a valid request.
+        # vLLM 0.12 `_maybe_get_adapters` (serving_engine.py:824) only checks
+        # `request.model` against `app.state.openai_serving_models.lora_requests`.
+        # Adapters added via runtime add_lora() update the engine but not this
+        # dict. We insert here, with placeholder paths — the path is never read
+        # because the actual weights come from verl's TensorLoRARequest in
+        # add_lora() during weight-sync, keyed by lora_int_id.
+        if getattr(self.model_config, "multi_lora", False):
+            from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+            from vllm.lora.request import LoRARequest as _LoRARequest
+            _registry = app.state.openai_serving_models.lora_requests
+            for _role, _info in ROLE_LORA_REGISTRY.items():
+                _registry[_info["name"]] = _LoRARequest(
+                    lora_name=_info["name"],
+                    lora_int_id=_info["int_id"],
+                    lora_path=_info["path"],
+                )
+            if self.replica_rank == 0:
+                logger.info(
+                    f"[multi-lora] Registered {len(ROLE_LORA_REGISTRY)} adapter "
+                    f"names in OpenAI serving registry: "
+                    f"{list(ROLE_LORA_REGISTRY.keys())}"
+                )
+
         self.engine = engine_client
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
 
