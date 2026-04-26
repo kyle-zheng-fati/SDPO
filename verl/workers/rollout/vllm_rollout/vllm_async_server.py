@@ -462,6 +462,17 @@ class vLLMHttpServer:
         # reverted Option A `--lora-modules` attempt at SHA `e81f97a`).
         # Validated by `tests/smoke_multi_lora_registry.py`, which exercises
         # the same dict-insert via `/v1/load_lora_adapter` REST.
+        #
+        # Self-verifying log: emitted UNCONDITIONALLY (and on every replica)
+        # so an operator can grep `[multi-lora] checking` and immediately see
+        # whether the Hydra config (`+actor_rollout_ref.model.multi_lora`)
+        # propagated to `model_config.multi_lora`. If `value=False` or
+        # `<missing>`, the patch below is silently skipped — that's the
+        # signal the config didn't reach the dataclass.
+        logger.info(
+            f"[multi-lora] checking model_config.multi_lora — hasattr={hasattr(self.model_config, 'multi_lora')!r} "
+            f"value={getattr(self.model_config, 'multi_lora', '<missing>')!r}"
+        )
         if getattr(self.model_config, "multi_lora", False):
             from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
             from vllm.lora.request import LoRARequest as _LoRARequest
