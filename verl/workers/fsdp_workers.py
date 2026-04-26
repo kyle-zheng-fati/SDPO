@@ -1231,11 +1231,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         )
                         role_metrics = self.actor.update_policy(data=role_data)
 
-                        # Only count REAL samples in metric weighting; skip if
-                        # this rank's role-batch was 100% padded (no signal).
-                        if n_real == 0:
-                            continue
-
+                        # Per-rank n_real may be 0 (this rank's role-batch was
+                        # 100% padded, with no real signal). We MUST still emit
+                        # the per-role metric keys here — DataProto.concat
+                        # downstream calls list_of_dict_to_dict_of_list
+                        # (verl/protocol.py:208) which asserts every DP rank's
+                        # metrics dict has identical key sets. Aggregate
+                        # weighting is naturally correct because the per-role
+                        # value is multiplied by n_real below (so n_real=0 adds
+                        # 0 to the aggregate), and total_samples += n_real is a
+                        # no-op for n_real=0. Earlier `if n_real == 0: continue`
+                        # here dropped keys asymmetrically and crashed at
+                        # update_actor's return path. See
+                        # AlchologicsAnyonmoys/.planning/ISSUES.md ISSUE-029
+                        # follow-up + tests/test_multi_lora_dp_symmetry.py
+                        # `--buggy-metric-emit` regression check.
                         total_samples += n_real
                         # update_policy returns list-valued metrics (via append_to_dict);
                         # reduce to scalars so the old isinstance(v, (int, float)) guard
