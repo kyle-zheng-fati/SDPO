@@ -989,12 +989,23 @@ class AgentLoopManager:
         """Sleep all rollout replica instances."""
         self._run_all([replica.sleep() for replica in self.rollout_replicas])
 
+    def abort_all_requests(self) -> list[dict]:
+        """Abort in-flight rollout requests on replicas that support it."""
+        tasks = [
+            replica.abort_all_requests()
+            for replica in self.rollout_replicas
+            if hasattr(replica, "abort_all_requests")
+        ]
+        if not tasks:
+            return []
+        return self._run_all(tasks)
+
     def clear_kv_cache(self):
         """Clear all rollout kv cache, but don`t sleep."""
         self._run_all([replica.clear_kv_cache() for replica in self.rollout_replicas])
 
     def _run_all(self, tasks: list[asyncio.Task]):
         async def run_all():
-            await asyncio.gather(*tasks)
+            return await asyncio.gather(*tasks)
 
-        asyncio.run(run_all())
+        return asyncio.run(run_all())
