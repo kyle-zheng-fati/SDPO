@@ -64,39 +64,70 @@ def subem_check(prediction, golden_answers):
 
 
 def extract_solution(solution_str):
-    """Extract the equation from the solution string."""
+    """Extract the final answer from a planner TERMINATE response.
+
+    Implements the JSON-`answer`-key contract: the response must contain a
+    JSON object with an ``"answer"`` key whose value is a non-empty string.
+    Returns the string on success, or ``None`` on contract failure (which
+    ``compute_score`` translates to reward 0).
+
+    The implementation is intentionally self-contained — verl is a
+    git submodule and must not depend on our project's ``src/`` package.
+    The semantics mirror :func:`src.utils.answer_extraction.extract_answer_strict`
+    but without raising or carrying role/step-number metadata (verl's
+    scorer never propagated those).
+    """
     import json
-    
-    # Try to load JSON and extract from answer key
-    json_match = re.search(r"\{.*\}", solution_str, re.DOTALL)
-    if json_match:
-        try:
-            json_str = json_match.group(0)
-            json_str = re.sub(r'"answer"\s*:\s*(<answer>.*?</answer>)', r'"answer": "\1"', json_str)
-            parsed = json.loads(json_str)
-            if "answer" in parsed:
-                ans_val = str(parsed["answer"])
-                matches = list(re.finditer(r"<answer>(.*?)</answer>", ans_val, re.DOTALL))
-                if matches:
-                    return matches[-1].group(1).strip()
-                # JSON parsed and has an "answer" key, but no <answer> tag
-                # block inside the value. Fall through to the fallback
-                # regex; if that also misses, the function returns None
-                # (existing contract — no tags = no extracted answer).
-        except Exception:
-            pass
 
-    # Fallback to negative lookahead regex
-    answer_pattern = r"<answer>((?:(?!</?answer>).)*)</answer>"
-    match = re.finditer(answer_pattern, solution_str, re.DOTALL)
-    matches = list(match)
-
-    # If there are 0  matches, return None
-    if len(matches) < 1:
+    if not solution_str or not str(solution_str).strip():
         return None
 
-    # If there are 2 or more matches, return the last one
-    return matches[-1].group(1).strip()
+    # Strip <think>...</think> blocks (closed and unclosed-leading) before
+    # JSON scanning so reasoning content cannot pollute extraction.
+    cleaned = re.sub(r"<think>.*?</think>", "", solution_str, flags=re.DOTALL)
+    if "<think>" in cleaned and "</think>" not in cleaned:
+        idx = cleaned.find("<think>")
+        cleaned = cleaned[:idx]
+
+    # Strip markdown fences and Python-style string concatenation.
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned)
+    cleaned = cleaned.replace("```", "")
+    cleaned = re.sub(r'"\s*\+\s*"', "", cleaned)
+
+    # Try straight JSON parse first.
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict) and "answer" in parsed:
+            ans = parsed["answer"]
+            if ans is not None and isinstance(ans, (str, int, float)) and str(ans).strip():
+                return str(ans).strip()
+    except json.JSONDecodeError:
+        pass
+
+    # Right-to-left brace scan for the last balanced {...} containing "answer".
+    depth = 0
+    end = None
+    for i in range(len(cleaned) - 1, -1, -1):
+        ch = cleaned[i]
+        if ch == "}":
+            if depth == 0:
+                end = i
+            depth += 1
+        elif ch == "{":
+            depth -= 1
+            if depth == 0 and end is not None:
+                candidate = cleaned[i:end + 1]
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict) and "answer" in parsed:
+                        ans = parsed["answer"]
+                        if ans is not None and isinstance(ans, (str, int, float)) and str(ans).strip():
+                            return str(ans).strip()
+                except json.JSONDecodeError:
+                    pass
+                end = None  # continue scanning leftward
+
+    return None
 
 
 def count_answer_tags(text):
