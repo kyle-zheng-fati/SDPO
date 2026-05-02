@@ -1852,6 +1852,22 @@ class RayPPOTrainer:
                     if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
+                # Emit core train metrics immediately after model updates so W&B
+                # reflects step progress before optional validate/save phases finish.
+                early_metrics = dict(metrics)
+                early_metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
+                early_metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                gradient_norm = early_metrics.get("actor/grad_norm", None)
+                early_metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
+                logger.log(data=early_metrics, step=self.global_steps)
+
+                late_metrics = {}
+
                 # validate
                 if (
                     self.val_reward_fn is not None
@@ -1863,6 +1879,7 @@ class RayPPOTrainer:
                         if is_last_step:
                             last_val_metrics = val_metrics
                     metrics.update(val_metrics)
+                    late_metrics.update(val_metrics)
 
                 # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                 esi_close_to_expiration = should_save_ckpt_esi(
@@ -1901,30 +1918,19 @@ class RayPPOTrainer:
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
-                # training metrics
-                metrics.update(
-                    {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
-                    }
-                )
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                late_metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                # compute variance proxy metrics
-                gradient_norm = metrics.get("actor/grad_norm", None)
-                metrics.update(compute_variance_proxy_metrics(batch=batch, gradient_norm=gradient_norm))
-                # Note: mismatch metrics (KL, PPL, etc.) are collected at line 1179 after advantage computation
+                late_metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
 
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
 
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                # Emit late-step metrics (validation/checkpoint/timing) at the same
+                # step index. Backends merge these with the earlier log.
+                if late_metrics:
+                    logger.log(data=late_metrics, step=self.global_steps)
 
                 progress_bar.update(1)
                 self.global_steps += 1
