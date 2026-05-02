@@ -94,6 +94,10 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    # AgentFlow extension — read by AgentFlow/agentflow/verl/trainer.py to
+    # filter SDPO loss to specific role slices (planner, executor, ...).
+    # Verl's loss math is unaffected; this is a pass-through field.
+    target_roles: list[str] = field(default_factory=lambda: ["planner"])
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:

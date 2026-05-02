@@ -37,6 +37,36 @@ from verl.utils.hdfs_io import makedirs
 from verl.workers.rollout.replica import get_rollout_replica_class
 
 
+def _extract_text_blocks(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return parts
+    return []
+
+
+def _extract_chat_message_text(message):
+    reasoning = _extract_text_blocks(getattr(message, "reasoning_content", None))
+    if not reasoning:
+        reasoning = _extract_text_blocks(getattr(message, "reasoning", None))
+    content = _extract_text_blocks(getattr(message, "content", None))
+    return "\n".join(reasoning + content).strip()
+
+
 async def start_server(config):
     tp_size = config.actor_rollout_ref.rollout.tensor_model_parallel_size
     num_replicas = (config.trainer.n_gpus_per_node * config.trainer.nnodes) // tp_size
@@ -172,7 +202,7 @@ def main(config):
     results = list(itertools.chain.from_iterable(gen_results))
 
     # extract content from results
-    results = np.array([result.choices[0].message.content for result in results])
+    results = np.array([_extract_chat_message_text(result.choices[0].message) for result in results])
     results = np.reshape(results, (-1, n_samples))
 
     assert results.shape == (len(chat_lst), n_samples)
