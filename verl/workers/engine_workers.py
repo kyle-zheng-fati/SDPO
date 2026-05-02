@@ -13,6 +13,7 @@
 # limitations under the License.
 import logging
 import os
+import time
 from contextlib import nullcontext
 from functools import partial
 from itertools import chain
@@ -567,30 +568,43 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DIRECT_ROLLOUT_METHOD)
     async def wake_up(self):
         """Context switch trainer mode to rollout mode."""
+        t_wake_start = time.time()
         aggressive_empty_cache(force_sync=True)
         set_expandable_segments(False)
 
         # 1. get per tensor generator from engine, this will load model to gpu
+        t0 = time.time()
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=self.base_sync_done
         )
+        logger.warning(f"[wake_up] step1 get_per_tensor_param (layered_summon={self.layered_summon}): {time.time()-t0:.1f}s")
 
         # 2. resume weights and update weights
+        t0 = time.time()
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["weights"])
+        logger.warning(f"[wake_up] step2a resume weights: {time.time()-t0:.1f}s")
         log_gpu_memory_usage("After resume weights", logger=logger)
+
+        t0 = time.time()
         await self.rollout.update_weights(per_tensor_param, peft_config=peft_config, base_sync_done=self.base_sync_done)
+        logger.warning(f"[wake_up] step2b update_weights: {time.time()-t0:.1f}s")
         log_gpu_memory_usage("After update_weights", logger=logger)
 
         # 3. offload model to cpu
+        t0 = time.time()
         self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
         aggressive_empty_cache(force_sync=True)
+        logger.warning(f"[wake_up] step3 offload to cpu: {time.time()-t0:.1f}s")
 
         # 4. resume kv_cache
+        t0 = time.time()
         if self.config.rollout.free_cache_engine:
             await self.rollout.resume(tags=["kv_cache"])
+        logger.warning(f"[wake_up] step4 resume kv_cache: {time.time()-t0:.1f}s")
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
+        logger.warning(f"[wake_up] TOTAL: {time.time()-t_wake_start:.1f}s")
         self.base_sync_done = True
         # important: need to manually set the random states of each tp to be identical.
         self.torch_random_states = get_torch_device().get_rng_state()

@@ -95,7 +95,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             checkpoint_config=checkpoint_config,
         )
 
-    def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load=False):
+    def load_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        del_local_after_load=False,
+        load_model: Optional[bool] = None,
+    ):
         """
         Load an FSDP checkpoint for this rank.
 
@@ -107,12 +113,20 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             local_path: Directory with per-rank checkpoint files.
             hdfs_path: Unused (for API compatibility).
             del_local_after_load: Remove local files after loading.
+            load_model: Per-call override for ``should_load_model``. Set to
+                False on LoRA resume so we don't try to read the base-model
+                ``.pt`` shards (which weren't written when ``save_model=False``
+                was passed during save). The LoRA adapter is reloaded by the
+                worker layer from ``lora_adapter/``; the base model is loaded
+                from the HF model id at startup as usual.
         """
         if local_path is None:
             return
 
+        effective_load_model = self.should_load_model if load_model is None else load_model
+
         # check if the checkpoint_load_contents is valid
-        if self.should_load_model:
+        if effective_load_model:
             assert self.model is not None, "model must be provided when checkpoint_contents.load includes ['model']"
         if self.should_load_optimizer:
             assert self.optimizer is not None, (
@@ -122,7 +136,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # every rank download its own checkpoint
         state_dict_cfg = (
             ShardedStateDictConfig(offload_to_cpu=True if is_cuda_available else False)
-            if self.should_load_model
+            if effective_load_model
             else None
         )
         optim_cfg = (
@@ -131,7 +145,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             else None
         )
         with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
-            if self.should_load_model:
+            if effective_load_model:
                 remote_model_path = os.path.join(local_path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_model_path = copy_to_local(remote_model_path)
                 model_state_dict = torch.load(local_model_path, weights_only=False)
@@ -177,7 +191,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to load checkpoints
         torch.distributed.barrier()
 
-    def save_checkpoint(self, local_path: str, hdfs_path: str = None, global_step: int = 0, max_ckpt_to_keep=None):
+    def save_checkpoint(
+        self,
+        local_path: str,
+        hdfs_path: str = None,
+        global_step: int = 0,
+        max_ckpt_to_keep=None,
+        save_model: Optional[bool] = None,
+    ):
         """
         Save an FSDP checkpoint for this rank.
 
@@ -194,9 +215,22 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             hdfs_path: Unused (for API compatibility).
             global_step: Current training step (used for bookkeeping).
             max_ckpt_to_keep: Number of recent checkpoints to retain.
+            save_model: Per-call override for ``should_save_model``. When set,
+                wins over the config-derived default. Used by LoRA training
+                in ``fsdp_workers.save_checkpoint`` to skip the redundant
+                FSDP-sharded base-model write (~30 GB / step for an 8B
+                base + LoRA setup) — the LoRA adapter is saved separately
+                via the worker's ``layered_summon_lora_params`` path.
+                Optimizer + extra state are unaffected (LoRA-only optimizer
+                state is small and still useful for resume).
         """
         if local_path is None:
             return
+
+        # Per-call override for the model-save branch. Other branches
+        # (optimizer, extra, HF tokenizer/config) follow their config
+        # defaults so resume + tokenizer recovery still work for LoRA.
+        effective_save_model = self.should_save_model if save_model is None else save_model
 
         # record the previous global step
         self.previous_global_step = global_step
@@ -208,7 +242,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         torch.distributed.barrier()
 
         # check if the checkpoint_save_contents is valid
-        if self.should_save_model:
+        if effective_save_model:
             assert self.model is not None, "model must be provided when checkpoint_contents.save includes ['model']"
         if self.should_save_optimizer:
             assert self.optimizer is not None, (
@@ -225,7 +259,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 extra_path = os.path.join(local_path, f"extra_state_world_size_{self.world_size}_rank_{self.rank}.pt")
 
-                if self.should_save_model:
+                if effective_save_model:
                     model_state_dict = self.model.state_dict()
                     torch.save(model_state_dict, model_path)
                     log_with_rank(f"Saved model to {os.path.abspath(model_path)}", rank=self.rank, logger=logger)
@@ -297,7 +331,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to dump to local
         torch.distributed.barrier()
 
-        if self.should_save_hf_model:
+        # Gate hf_model save on the same per-call override as the sharded
+        # model save — otherwise a LoRA training run with both 'model' and
+        # 'hf_model' in save_contents would still dump the full ~30 GB base
+        # via the HF path even though the caller asked for save_model=False.
+        if self.should_save_hf_model and effective_save_model:
             # Only rank 0 will save hf model and,
             # offload to cpu to save LLMs which may be too large to fit in one GPU
             state_dict = get_fsdp_full_state_dict(self.model, offload_to_cpu=True, rank0_only=True)

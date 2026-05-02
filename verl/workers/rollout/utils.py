@@ -58,20 +58,47 @@ def get_free_port(address: str) -> tuple[int, socket.socket]:
 
 
 async def run_unvicorn(app: FastAPI, server_args, server_address, max_retries=5) -> tuple[int, asyncio.Task]:
+    """Bind a uvicorn HTTP server in the background and return (port, task).
+
+    2026-04-16 fix: previous implementation set ``server.should_exit = True``
+    BEFORE ``await server.serve()`` — this made uvicorn run startup() (briefly
+    binding the socket) and then shutdown() (releasing it) before any request
+    could land. The follow-up ``asyncio.create_task(server.main_loop())`` did
+    not re-bind the socket, so the HTTP port stayed unbound forever and every
+    rollout request returned 503. Replace the hack with a real background task
+    and synchronously wait for ``server.started`` so callers receive a port
+    that is actually listening.
+    """
+    import time as _t
     server_port, server_task = None, None
 
-    for i in range(max_retries):
+    for _ in range(max_retries):
         try:
             server_port, sock = get_free_port(server_address)
+            sock.close()  # release the probe socket; uvicorn will rebind
             app.server_args = server_args
             config = uvicorn.Config(app, host=server_address, port=server_port, log_level="warning")
             server = uvicorn.Server(config)
-            server.should_exit = True
-            await server.serve()
-            server_task = asyncio.create_task(server.main_loop())
+            server_task = asyncio.create_task(server.serve())
+            # Wait until uvicorn has finished startup() and is ready to accept
+            # requests. Bound the wait so a stuck server can be retried.
+            t_wait_start = _t.time()
+            while not server.started:
+                if server_task.done():
+                    raise RuntimeError(f"uvicorn task exited before startup completed: {server_task.exception()}")
+                if _t.time() - t_wait_start > 30:
+                    raise TimeoutError("uvicorn did not signal started within 30s")
+                await asyncio.sleep(0.05)
             break
-        except (OSError, SystemExit) as e:
-            logger.error(f"Failed to start HTTP server on port {server_port} at try {i}, error: {e}")
+        except (OSError, SystemExit, TimeoutError, RuntimeError) as e:
+            logger.error(f"Failed to start HTTP server on port {server_port}, error: {e}")
+            if server_task is not None and not server_task.done():
+                server_task.cancel()
+                try:
+                    await server_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                server_task = None
     else:
         logger.error(f"Failed to start HTTP server after {max_retries} retries, exiting...")
         os._exit(-1)

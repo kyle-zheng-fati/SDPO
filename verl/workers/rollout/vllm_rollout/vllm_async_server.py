@@ -202,7 +202,9 @@ class vLLMHttpServer:
 
         self.config: RolloutConfig = omega_conf_to_dataclass(config)
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config, dataclass_type=HFModelConfig)
-        self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
+        # Respect user-specified max_model_len if set; otherwise use model's native max.
+        if self.config.max_model_len is None:
+            self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
         self.rollout_mode = rollout_mode
         self.workers = workers
 
@@ -355,10 +357,13 @@ class vLLMHttpServer:
 
         # update lora-related args
         if self.model_config.lora_rank > 0:
+            multi_lora = getattr(self.model_config, "multi_lora", False)
+            from verl.workers.rollout.vllm_rollout.utils import MULTI_LORA_MAX_ADAPTERS
+            max_loras = MULTI_LORA_MAX_ADAPTERS if multi_lora else 1
             args.update(
                 {
                     "enable_lora": True,
-                    "max_loras": 1,
+                    "max_loras": max_loras,
                     "max_lora_rank": get_vllm_max_lora_rank(self.model_config.lora_rank),
                 }
             )
@@ -389,7 +394,13 @@ class vLLMHttpServer:
         distributed_executor_backend = ExternalZeroMQDistributedExecutor if len(self.workers) > 0 else None
         server_args.distributed_executor_backend = distributed_executor_backend
 
-        zmq_addresses = ray.get([worker.get_zeromq_address.remote() for worker in self.workers])
+        # 2026-04-16: wrap blocking ray.get in asyncio.to_thread so the async actor's
+        # event loop stays free to send Ray heartbeats. Without this, the actor was
+        # killed by Ray's heartbeat watchdog during init, leaving the HTTP port unbound.
+        zmq_addresses = await asyncio.to_thread(
+            ray.get,
+            [worker.get_zeromq_address.remote() for worker in self.workers],
+        )
         logger.info(
             f"replica_rank={self.replica_rank}, node_rank={self.node_rank}, nnodes={self.nnodes}, "
             f"get worker zmq addresses: {zmq_addresses}"
@@ -415,7 +426,17 @@ class vLLMHttpServer:
         if "disable_log_stats" in fn_args:
             kwargs["disable_log_stats"] = engine_args.disable_log_stats
 
-        engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
+        # 2026-04-16: AsyncLLM.from_vllm_config is a synchronous constructor whose
+        # internal MPClient.__init__ does a blocking ZMQ poll waiting for EngineCore
+        # READY. Inside an async Ray actor this blocks the event loop, Ray heartbeat
+        # fails, the actor is killed, and uvicorn (line 437) is never reached.
+        # asyncio.to_thread runs it in a thread; the event loop stays responsive.
+        engine_client = await asyncio.to_thread(
+            AsyncLLM.from_vllm_config,
+            vllm_config=vllm_config,
+            usage_context=usage_context,
+            **kwargs,
+        )
 
         # Don't keep the dummy data in memory
         await engine_client.reset_mm_cache()
@@ -427,6 +448,47 @@ class vLLMHttpServer:
             await init_app_state(engine_client, vllm_config, app.state, args)
         if self.replica_rank == 0 and self.node_rank == 0:
             logger.info(f"Initializing a V1 LLM engine with config: {vllm_config}")
+
+        # Multi-LoRA: register adapter NAMES with vLLM's OpenAI server registry
+        # so that /v1/chat/completions accepts model=<role> as a valid request.
+        # vLLM 0.12 `_maybe_get_adapters` (serving_engine.py:824) only checks
+        # `request.model` against `app.state.openai_serving_models.lora_requests`.
+        # Adapters added via runtime add_lora() update the engine but not this
+        # dict. We insert here, with placeholder paths — the path is never read
+        # because the actual weights come from verl's TensorLoRARequest in
+        # add_lora() during weight-sync, keyed by lora_int_id.
+        #
+        # See `.planning/ISSUES.md` ISSUE-026 for the full diagnosis (and the
+        # reverted Option A `--lora-modules` attempt at SHA `e81f97a`).
+        # Validated by `tests/smoke_multi_lora_registry.py`, which exercises
+        # the same dict-insert via `/v1/load_lora_adapter` REST.
+        #
+        # Self-verifying log: emitted UNCONDITIONALLY (and on every replica)
+        # so an operator can grep `[multi-lora] checking` and immediately see
+        # whether the Hydra config (`+actor_rollout_ref.model.multi_lora`)
+        # propagated to `model_config.multi_lora`. If `value=False` or
+        # `<missing>`, the patch below is silently skipped — that's the
+        # signal the config didn't reach the dataclass.
+        logger.info(
+            f"[multi-lora] checking model_config.multi_lora — hasattr={hasattr(self.model_config, 'multi_lora')!r} "
+            f"value={getattr(self.model_config, 'multi_lora', '<missing>')!r}"
+        )
+        if getattr(self.model_config, "multi_lora", False):
+            from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+            from vllm.lora.request import LoRARequest as _LoRARequest
+            _registry = app.state.openai_serving_models.lora_requests
+            for _role, _info in ROLE_LORA_REGISTRY.items():
+                _registry[_info["name"]] = _LoRARequest(
+                    lora_name=_info["name"],
+                    lora_int_id=_info["int_id"],
+                    lora_path=_info["path"],
+                )
+            if self.replica_rank == 0:
+                logger.info(
+                    f"[multi-lora] Registered {len(ROLE_LORA_REGISTRY)} adapter "
+                    f"names in OpenAI serving registry: "
+                    f"{list(ROLE_LORA_REGISTRY.keys())}"
+                )
 
         self.engine = engine_client
         self._server_port, self._server_task = await run_unvicorn(app, args, self._server_address)
@@ -465,6 +527,7 @@ class vLLMHttpServer:
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
         priority: int = 0,
+        lora_adapter_name: Optional[str] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # Calculate the maximum possible new tokens based on available context space
@@ -504,15 +567,28 @@ class vLLMHttpServer:
 
         prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
 
-        # Add lora request
+        # Add lora request — route to a specific adapter in multi-LoRA mode
         lora_request = None
         if self.model_config.lora_rank > 0:
-            # Make sure we also check that the lora is already loaded in the engine
-            lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
-            if lora_loaded:
-                lora_request = LoRARequest(
-                    lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
-                )
+            if lora_adapter_name is not None:
+                # Multi-LoRA: route to the named adapter.
+                from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
+                role_info = ROLE_LORA_REGISTRY.get(lora_adapter_name)
+                if role_info is not None:
+                    loaded_ids = await self.engine.list_loras()
+                    if role_info["int_id"] in loaded_ids:
+                        lora_request = LoRARequest(
+                            lora_name=role_info["name"],
+                            lora_int_id=role_info["int_id"],
+                            lora_path=role_info["path"],
+                        )
+            else:
+                # Single-adapter mode (backward compat).
+                lora_loaded = VLLM_LORA_INT_ID in await self.engine.list_loras()
+                if lora_loaded:
+                    lora_request = LoRARequest(
+                        lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
+                    )
 
         generator = self.engine.generate(
             prompt=prompt,

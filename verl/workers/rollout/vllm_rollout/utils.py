@@ -13,12 +13,104 @@
 # limitations under the License.
 
 import json
+import os
 from typing import Any
 
 # magic numbers that ensure we are using the same LoRA adapter during the rollout and training process
 VLLM_LORA_INT_ID = 123
 VLLM_LORA_NAME = "123"
 VLLM_LORA_PATH = "simon_lora_path"
+
+# Multi-LoRA role registry: maps each agent role to a unique vLLM adapter slot.
+# Used when multi_lora=True to serve 5 per-role LoRA adapters from one vLLM instance.
+ROLE_LORA_REGISTRY: dict[str, dict] = {
+    "planner":               {"int_id": 1, "name": "planner",               "path": "lora_planner"},
+    "executor":              {"int_id": 2, "name": "executor",              "path": "lora_executor"},
+    "Python_Coder_Tool":     {"int_id": 3, "name": "Python_Coder_Tool",     "path": "lora_python_coder"},
+    "Web_Search":            {"int_id": 4, "name": "Web_Search",            "path": "lora_web_search"},
+    "Wikipedia_Search_Tool": {"int_id": 5, "name": "Wikipedia_Search_Tool", "path": "lora_wikipedia"},
+}
+
+# Total number of adapters for vLLM max_loras config.
+MULTI_LORA_MAX_ADAPTERS = len(ROLE_LORA_REGISTRY)
+
+
+def resolve_multi_lora_resume_paths(
+    parent_dir: str,
+    registry_keys: list[str],
+) -> list[tuple[str, str]]:
+    """Resolve per-role subdirectories under a multi-LoRA checkpoint parent.
+
+    Expected on-disk layout (as produced by the multi-LoRA save loop in
+    ``fsdp_workers.py``)::
+
+        <parent_dir>/
+            planner/
+                adapter_model.safetensors
+                adapter_config.json
+            executor/
+                ...
+            Python_Coder_Tool/
+                ...
+            ...
+
+    The function iterates ``registry_keys`` (preserving order — the first
+    entry is used for ``PeftModel.from_pretrained`` and the rest are attached
+    via ``load_adapter``) and for each expected adapter verifies the subdir
+    exists and contains ``adapter_model.safetensors`` + ``adapter_config.json``.
+
+    On ANY missing subdir or missing weight file, a ``RuntimeError`` is
+    raised listing every missing path. This is intentional: silently
+    partial-loading 1/5 adapters (the pre-fix behavior) corrupted training
+    by leaving 4/5 adapters at random init while loss curves looked fine.
+
+    Args:
+        parent_dir: Filesystem path containing per-role subdirectories.
+        registry_keys: Ordered list of adapter names expected under
+            ``parent_dir`` (typically ``list(ROLE_LORA_REGISTRY.keys())``).
+
+    Returns:
+        List of ``(adapter_name, full_subdir_path)`` tuples, in the order
+        given by ``registry_keys``.
+
+    Raises:
+        RuntimeError: If ``parent_dir`` is not a directory, or if any
+            expected subdirectory / required file is missing.
+    """
+    if not os.path.isdir(parent_dir):
+        raise RuntimeError(
+            f"Multi-LoRA resume parent path is not a directory: {parent_dir}. "
+            f"Expected a parent containing per-role subdirectories "
+            f"(e.g. {parent_dir}/planner/, {parent_dir}/executor/, ...)."
+        )
+
+    resolved: list[tuple[str, str]] = []
+    missing: list[str] = []
+    for name in registry_keys:
+        subdir = os.path.join(parent_dir, name)
+        weights = os.path.join(subdir, "adapter_model.safetensors")
+        config = os.path.join(subdir, "adapter_config.json")
+        if not os.path.isdir(subdir):
+            missing.append(f"{subdir} (directory)")
+            continue
+        if not os.path.isfile(weights):
+            missing.append(weights)
+            continue
+        if not os.path.isfile(config):
+            missing.append(config)
+            continue
+        resolved.append((name, subdir))
+
+    if missing:
+        raise RuntimeError(
+            f"Multi-LoRA resume from {parent_dir}: {len(missing)} expected "
+            f"adapter artifact(s) are missing. Refusing to silently reset "
+            f"adapters to random init. Missing: {missing}. Expected one "
+            f"subdirectory per registry key {registry_keys}, each containing "
+            f"adapter_model.safetensors + adapter_config.json."
+        )
+
+    return resolved
 
 
 def get_vllm_max_lora_rank(lora_rank: int):

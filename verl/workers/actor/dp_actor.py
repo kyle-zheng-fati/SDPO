@@ -20,6 +20,7 @@ Single Process Actor
 import logging
 import os
 from types import SimpleNamespace
+from tqdm import tqdm
 from typing import Optional
 
 import torch
@@ -723,6 +724,9 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys.append("multi_modal_inputs")
         if self.use_prefix_grouper and "uid" in data.non_tensor_batch.keys():
             non_tensor_select_keys.append("uid")
+        # Preserve agent_name_list for multi-LoRA gradient routing
+        if "agent_name_list" in data.non_tensor_batch:
+            non_tensor_select_keys.append("agent_name_list")
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -737,6 +741,17 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/kl_loss": 0.0,
         }
         did_update = False
+        _is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        n_mini_batches = len(mini_batches)
+        total_iters = self.config.ppo_epochs * n_mini_batches
+        _update_bar = tqdm(
+            total=total_iters,
+            desc="  mini-batches",
+            position=1,
+            leave=False,
+            dynamic_ncols=True,
+            disable=not _is_rank0,
+        )
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
@@ -915,6 +930,8 @@ class DataParallelPPOActor(BasePPOActor):
                     did_update = True
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                _update_bar.update(1)
+        _update_bar.close()
         self.actor_optimizer.zero_grad()
         if did_update:
             self._update_teacher()
