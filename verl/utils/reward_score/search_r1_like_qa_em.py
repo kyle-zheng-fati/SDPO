@@ -65,16 +65,29 @@ def subem_check(prediction, golden_answers):
 
 def extract_solution(solution_str):
     """Extract the equation from the solution string."""
-    # Remove everything before the first "Assistant:"
-    # if "Assistant:" in solution_str:
-    #     solution_str = solution_str.split("Assistant:", 1)[1]
-    # elif "<|im_start|>assistant" in solution_str:
-    #     solution_str = solution_str.split("<|im_start|>assistant", 1)[1]
-    # else:
-    #     return None
-    # solution_str = solution_str.split('\n')[-1]
+    import json
+    
+    # Try to load JSON and extract from answer key
+    json_match = re.search(r"\{.*\}", solution_str, re.DOTALL)
+    if json_match:
+        try:
+            json_str = json_match.group(0)
+            json_str = re.sub(r'"answer"\s*:\s*(<answer>.*?</answer>)', r'"answer": "\1"', json_str)
+            parsed = json.loads(json_str)
+            if "answer" in parsed:
+                ans_val = str(parsed["answer"])
+                matches = list(re.finditer(r"<answer>(.*?)</answer>", ans_val, re.DOTALL))
+                if matches:
+                    return matches[-1].group(1).strip()
+                # JSON parsed and has an "answer" key, but no <answer> tag
+                # block inside the value. Fall through to the fallback
+                # regex; if that also misses, the function returns None
+                # (existing contract — no tags = no extracted answer).
+        except Exception:
+            pass
 
-    answer_pattern = r"<answer>(.*?)</answer>"
+    # Fallback to negative lookahead regex
+    answer_pattern = r"<answer>((?:(?!</?answer>).)*)</answer>"
     match = re.finditer(answer_pattern, solution_str, re.DOTALL)
     matches = list(match)
 
