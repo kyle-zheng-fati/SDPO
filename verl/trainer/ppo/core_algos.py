@@ -312,7 +312,12 @@ def compute_grpo_outcome_advantage(
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
+                # Single-sample group: use the sample's own score as the
+                # baseline so advantage = (r - r) / 1 = 0. The previous
+                # hardcode `id2mean = 0.0` produced advantage = r, which
+                # injects raw reward into the loss and silently breaks
+                # GRPO's group-relative semantics.
+                id2mean[idx] = id2score[idx][0]
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
@@ -1102,6 +1107,27 @@ def compute_self_distillation_loss(
     loss_mask = response_mask
     if self_distillation_mask is not None:
         loss_mask = loss_mask * self_distillation_mask.unsqueeze(1)
+    loss_mask_bool = loss_mask.bool()
+    response_mask_bool = response_mask.bool()
+
+    def _masked_mean_item(values: torch.Tensor, mask: torch.Tensor) -> float:
+        mask = mask.bool()
+        if not torch.any(mask):
+            return 0.0
+        return values.detach().masked_select(mask).mean().item()
+
+    def _masked_max_item(values: torch.Tensor, mask: torch.Tensor) -> float:
+        mask = mask.bool()
+        if not torch.any(mask):
+            return 0.0
+        return values.detach().masked_select(mask).max().item()
+
+    response_token_count = response_mask_bool.sum().clamp(min=1)
+    eligible_token_count = loss_mask_bool.sum()
+    metrics["self_distillation/eligible_token_fraction"] = (
+        eligible_token_count.float() / response_token_count.float()
+    ).detach().item()
+    metrics["self_distillation/eligible_tokens"] = eligible_token_count.detach().item()
 
     if self_distillation_config.full_logit_distillation:
         use_topk = self_distillation_config.distillation_topk is not None
@@ -1160,10 +1186,30 @@ def compute_self_distillation_loss(
             kl_loss = torch.lerp(kl_student, kl_teacher, alpha)  # Compute the Generalized Jensen-Shannon Divergence
 
         per_token_loss = kl_loss.sum(-1)
+        with torch.no_grad():
+            student_entropy = -(student_distill_log_probs.exp() * student_distill_log_probs).sum(dim=-1)
+            teacher_entropy = -(teacher_distill_log_probs.exp() * teacher_distill_log_probs).sum(dim=-1)
+            metrics["self_distillation/student_distill_entropy"] = _masked_mean_item(student_entropy, loss_mask_bool)
+            metrics["self_distillation/teacher_distill_entropy"] = _masked_mean_item(teacher_entropy, loss_mask_bool)
     else:
         assert self_distillation_config.alpha == 1.0, "Only reverse KL is supported for non-full-logit distillation"
         log_ratio = student_log_probs - teacher_log_probs
         per_token_loss = log_ratio.detach() * student_log_probs
+
+    with torch.no_grad():
+        sampled_logp_gap = teacher_log_probs - student_log_probs
+        old_student_kl = old_log_probs - student_log_probs if old_log_probs is not None else None
+        metrics["self_distillation/distill_divergence"] = _masked_mean_item(per_token_loss, loss_mask_bool)
+        metrics["self_distillation/teacher_student_sampled_logp_gap"] = _masked_mean_item(
+            sampled_logp_gap, loss_mask_bool
+        )
+        metrics["self_distillation/teacher_student_sampled_logp_gap_abs"] = _masked_mean_item(
+            sampled_logp_gap.abs(), loss_mask_bool
+        )
+        if old_student_kl is not None:
+            metrics["self_distillation/old_student_sampled_kl"] = _masked_mean_item(
+                old_student_kl, loss_mask_bool
+            )
 
     is_clip = self_distillation_config.is_clip
     if is_clip is not None:
@@ -1172,12 +1218,28 @@ def compute_self_distillation_loss(
 
         negative_approx_kl = (student_log_probs - old_log_probs).detach()
         negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-        ratio = torch.exp(negative_approx_kl).clamp(max=is_clip)
+        unclipped_ratio = torch.exp(negative_approx_kl)
+        ratio = unclipped_ratio.clamp(max=is_clip)
+        with torch.no_grad():
+            metrics["self_distillation/is_ratio_mean"] = _masked_mean_item(ratio, loss_mask_bool)
+            metrics["self_distillation/is_ratio_max"] = _masked_max_item(ratio, loss_mask_bool)
+            metrics["self_distillation/is_ratio_clip_frac"] = _masked_mean_item(
+                (unclipped_ratio > is_clip).float(), loss_mask_bool
+            )
         per_token_loss = per_token_loss * ratio
 
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
+        with torch.no_grad():
+            metrics["self_distillation/rollout_is_weight_mean"] = _masked_mean_item(
+                rollout_is_weights, loss_mask_bool
+            )
+            metrics["self_distillation/rollout_is_weight_max"] = _masked_max_item(
+                rollout_is_weights, loss_mask_bool
+            )
         per_token_loss = per_token_loss * rollout_is_weights
+
+    metrics["self_distillation/weighted_distill_loss"] = _masked_mean_item(per_token_loss, loss_mask_bool)
 
     loss = agg_loss(
         loss_mat=per_token_loss,

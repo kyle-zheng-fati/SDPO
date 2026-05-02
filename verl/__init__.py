@@ -18,6 +18,10 @@ import os
 
 from packaging.version import parse as parse_version
 
+# Apply project-local vLLM monkeypatches BEFORE any verl module imports vLLM.
+# See verl/_vllm_patches/__init__.py for what's patched and why.
+from . import _vllm_patches  # noqa: F401
+
 from .protocol import DataProto
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs

@@ -60,6 +60,9 @@ class SelfDistillationConfig(BaseConfig):
         environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
         reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
         reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+        target_roles (List[str]): Agent roles that are targeted for SDPO distillation. Rows whose
+            agent_name is not in this list are dropped before the actor update. Default ``["planner"]``
+            for planner-only SDPO; set to ``["planner", "executor", ...]`` for all-role SDPO.
     """
 
     full_logit_distillation: bool = True
@@ -74,6 +77,7 @@ class SelfDistillationConfig(BaseConfig):
     dont_reprompt_on_self_success: bool = False
     remove_thinking_from_demonstration: bool = False
     is_clip: Optional[float] = None
+    target_roles: list = field(default_factory=lambda: ["planner"])
     reprompt_template: str = (
         "{prompt}{solution}{feedback}\n\n"
         "Correctly solve the original question.\n"
@@ -90,6 +94,10 @@ class SelfDistillationConfig(BaseConfig):
     )
     include_environment_feedback: bool = False
     environment_feedback_only_without_solution: bool = False
+    # AgentFlow extension — read by AgentFlow/agentflow/verl/trainer.py to
+    # filter SDPO loss to specific role slices (planner, executor, ...).
+    # Verl's loss math is unaffected; this is a pass-through field.
+    target_roles: list[str] = field(default_factory=lambda: ["planner"])
 
     def __post_init__(self):
         if not 0.0 <= self.alpha <= 1.0:
