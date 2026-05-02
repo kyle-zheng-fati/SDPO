@@ -316,5 +316,8 @@ ray_kwargs:
     # Number of CPUs for Ray. Use a fixed number instead of null when using SLURM.
     num_cpus: null
 
+    # opentelemetry-sdk >=1.24 removes _is_instrument_registered; dashboard fails on import.
+    include_dashboard: false
+
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null

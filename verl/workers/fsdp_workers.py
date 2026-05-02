@@ -1135,18 +1135,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             if self._multi_lora:
                 # Multi-LoRA: train each adapter on its own role's data.
                 # Iterate per-adapter with filtered data, accumulating metrics.
+                #
+                # FSDP DP>1 correctness (added 2026-04-26 to fix ISSUE-029
+                # in AlchologicsAnyonmoys/.planning/ISSUES.md):
+                # The original loop used `if not mask.any(): continue` which
+                # silently skipped FSDP collectives on ranks with 0 samples
+                # for a sparse role (e.g. Web_Search), while other ranks
+                # entered update_policy and blocked forever on _all_gather_base.
+                # We now (a) cross-rank-consensus on which roles to process,
+                # (b) cross-rank-max on per-role sample count, and (c) pad
+                # short ranks to the global max with zero-advantage no-op
+                # samples so PPO loss contribution is exactly zero (KL with
+                # coef ~1e-3 is the only residual, ~negligible).
                 from verl.workers.rollout.vllm_rollout.utils import ROLE_LORA_REGISTRY
                 peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)
                 agent_names = data.non_tensor_batch.get("agent_name_list")
                 all_metrics = {}
                 total_samples = 0
 
-                import numpy as np
+                role_list = list(ROLE_LORA_REGISTRY.keys())
+                world_size = dist.get_world_size() if dist.is_initialized() else 1
+                ddevice = next(peft_model.parameters()).device
 
                 with Timer(name="update_policy", logger=None) as timer:
                     # Log role distribution for diagnostics.
                     if agent_names is not None:
-                        known_mask = np.isin(agent_names, list(ROLE_LORA_REGISTRY.keys()))
+                        known_mask = np.isin(agent_names, role_list)
                         n_unknown = (~known_mask).sum()
                         if n_unknown > 0:
                             logger.warning(
@@ -1154,27 +1168,75 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                                 f"with unrecognized agent_name"
                             )
 
-                    for adapter_name in ROLE_LORA_REGISTRY:
-                        # Filter samples for this role.
+                    # Compute local per-role sample counts.
+                    if agent_names is not None:
+                        local_role_counts = torch.tensor(
+                            [int((agent_names == name).sum()) for name in role_list],
+                            dtype=torch.long, device=ddevice,
+                        )
+                    else:
+                        local_role_counts = torch.full(
+                            (len(role_list),), len(data), dtype=torch.long, device=ddevice,
+                        )
+                    # Cross-rank consensus: SUM = global count per role; MAX = pad-target per role.
+                    global_role_counts = local_role_counts.clone()
+                    max_role_counts = local_role_counts.clone()
+                    if world_size > 1:
+                        dist.all_reduce(global_role_counts, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(max_role_counts, op=dist.ReduceOp.MAX)
+
+                    for r_idx, adapter_name in enumerate(role_list):
+                        global_count = int(global_role_counts[r_idx].item())
+                        if global_count == 0:
+                            # Unanimous skip — no rank has samples for this role.
+                            continue
+                        max_count = int(max_role_counts[r_idx].item())
+
+                        # Build local indices for this role.
                         if agent_names is not None:
                             mask = agent_names == adapter_name
-                            if not mask.any():
-                                continue
                             indices = np.where(mask)[0].tolist()
-                            role_data = data.select_idxs(indices)
                         else:
-                            # No agent_name metadata — fall back to training
-                            # all data with each adapter (degenerate case).
-                            role_data = data
                             indices = list(range(len(data)))
+                        n_real = len(indices)
 
+                        # Pad to global max with no-op samples (advantages zeroed).
+                        n_pad = max_count - n_real
+                        if n_pad > 0:
+                            # Pad source: prefer first real index, else any index.
+                            pad_src = indices[0] if n_real > 0 else 0
+                            all_indices = indices + [pad_src] * n_pad
+                        else:
+                            all_indices = indices
+
+                        role_data = data.select_idxs(all_indices)
                         role_data.meta_info = dict(data.meta_info)
+
+                        # Zero advantages (and returns if present) for padded
+                        # rows so PPO loss contribution is exactly zero. KL
+                        # loss still fires (~kl_loss_coef * tiny_kl on padded
+                        # rows) but is below numerical noise vs real updates.
+                        if n_pad > 0:
+                            if "advantages" in role_data.batch.keys():
+                                role_data.batch["advantages"][n_real:] = 0
+                            if "returns" in role_data.batch.keys():
+                                role_data.batch["returns"][n_real:] = 0
+                            if "token_level_rewards" in role_data.batch.keys():
+                                role_data.batch["token_level_rewards"][n_real:] = 0
+
                         peft_model.set_adapter(adapter_name)
-                        logger.info(f"[multi-lora] Training adapter '{adapter_name}' on {len(indices)} samples")
+                        logger.info(
+                            f"[multi-lora] Training adapter '{adapter_name}' on {n_real} samples "
+                            f"(+ {n_pad} no-op pad → {max_count}; global={global_count})"
+                        )
                         role_metrics = self.actor.update_policy(data=role_data)
 
-                        n = len(indices)
-                        total_samples += n
+                        # Only count REAL samples in metric weighting; skip if
+                        # this rank's role-batch was 100% padded (no signal).
+                        if n_real == 0:
+                            continue
+
+                        total_samples += n_real
                         # update_policy returns list-valued metrics (via append_to_dict);
                         # reduce to scalars so the old isinstance(v, (int, float)) guard
                         # no longer silently drops pg_loss/kl_loss/entropy/grad_norm/etc.
@@ -1188,14 +1250,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                             all_metrics[per_role_key] = v
                             # Back-compat aggregate under the original key (weighted sum,
                             # normalized below). Preserves the pre-fix wandb contract.
-                            all_metrics[k] = all_metrics.get(k, 0.0) + v * n
+                            all_metrics[k] = all_metrics.get(k, 0.0) + v * n_real
 
                     # Weighted-mean only the aggregate (non-per-role) keys.
-                    role_names = set(ROLE_LORA_REGISTRY.keys())
+                    role_names_set = set(role_list)
                     if total_samples > 0:
                         for k in all_metrics:
                             parts = k.split("/")
-                            is_per_role_key = len(parts) >= 2 and parts[1] in role_names
+                            is_per_role_key = len(parts) >= 2 and parts[1] in role_names_set
                             if not is_per_role_key:
                                 all_metrics[k] /= total_samples
                     metrics = all_metrics
