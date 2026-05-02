@@ -312,7 +312,12 @@ def compute_grpo_outcome_advantage(
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
+                # Single-sample group: use the sample's own score as the
+                # baseline so advantage = (r - r) / 1 = 0. The previous
+                # hardcode `id2mean = 0.0` produced advantage = r, which
+                # injects raw reward into the loss and silently breaks
+                # GRPO's group-relative semantics.
+                id2mean[idx] = id2score[idx][0]
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
