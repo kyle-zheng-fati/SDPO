@@ -1100,6 +1100,7 @@ def compute_self_distillation_loss(
     self_distillation_mask: Optional[torch.Tensor] = None,
     loss_agg_mode: str = "token-mean",
     rollout_is_weights: Optional[torch.Tensor] = None,
+    temperature: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
 
     metrics = {}
@@ -1247,6 +1248,10 @@ def compute_self_distillation_loss(
         loss_agg_mode=loss_agg_mode,
         batch_num_tokens=loss_mask.sum().clamp(min=1.0),
     )
+    # Hinton et al. T² scaling: KL gradients shrink as 1/T², so multiply by T²
+    # to keep the distillation signal magnitude independent of sampling temperature.
+    loss = loss * (temperature ** 2)
+    metrics["self_distillation/temperature_sq_scale"] = temperature ** 2
     return loss, metrics
 
 
